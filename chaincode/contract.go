@@ -8,8 +8,8 @@ import (
   "strings"
   "time"
 
-  "github.com/hyperledger/fabric-contract-api-go/contractapi"
-  m "github.com/raddad/am-reputation/chaincode/internal"
+  "github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
+  m "github.com/raddadalmaayn/am-reputation/chaincode/internal"
 )
 
 const (
