@@ -5,8 +5,8 @@ import (
   "errors"
   "fmt"
   "math"
+  "strconv"
   "strings"
-  "time"
 
   "github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
   m "github.com/raddadalmaayn/am-reputation/chaincode/internal"
@@ -21,83 +21,75 @@ func makeKey(actorID, dim string) string {
   return fmt.Sprintf("%s%s:%s", stateKeyPrefix, strings.ToLower(actorID), strings.ToLower(dim))
 }
 
-// SubmitRating(targetID, dim, outcome(0|1), cid, ts)
-// NOTE: rater weight/stake/VC checks will be added in the next step.
-func (rc *ReputationContract) SubmitRating(ctx contractapi.TransactionContextInterface,
-  targetID string, dim string, outcome int, cid string, ts int64) (float64, error) {
-
-  if targetID == "" || dim == "" {
-    return 0, errors.New("targetID and dim are required")
-  }
-  if outcome != 0 && outcome != 1 {
-    return 0, errors.New("outcome must be 0 or 1")
-  }
-  if ts <= 0 {
-    ts = time.Now().Unix()
-  }
-
-  key := makeKey(targetID, dim)
-  stub := ctx.GetStub()
-
-  var st m.RepState
-  b, err := stub.GetState(key)
+func (rc *ReputationContract) GetReputation(ctx contractapi.TransactionContextInterface, actorID, dim string) (*m.ReputationState, error) {
+  key := makeKey(actorID, dim)
+  b, err := ctx.GetStub().GetState(key)
   if err != nil {
-    return 0, fmt.Errorf("get state: %w", err)
+    return nil, err
   }
-  if b != nil {
-    if err := json.Unmarshal(b, &st); err != nil {
-      return 0, fmt.Errorf("unmarshal: %w", err)
-    }
-  } else {
-    st = m.RepState{ActorID: targetID, Dim: dim, Alpha: 0, Beta: 0, LastTs: ts}
+  if len(b) == 0 {
+    // not found -> empty state
+    return &m.ReputationState{ActorID: actorID, Dim: dim, Alpha: 0, Beta: 0, LastTs: 0}, nil
   }
-
-  // Time decay
-  if st.LastTs > 0 && ts > st.LastTs {
-    dt := float64(ts - st.LastTs)
-    factor := math.Pow(defaultLambda, dt)
-    st.Alpha *= factor
-    st.Beta  *= factor
+  var st m.ReputationState
+  if err := json.Unmarshal(b, &st); err != nil {
+    return nil, err
   }
-
-  // (temp) rater weight = 1.0; we add bounded weight + stake next
-  if outcome == 1 {
-    st.Alpha += 1.0
-  } else {
-    st.Beta  += 1.0
-  }
-  st.LastTs = ts
-
-  out, err := json.Marshal(&st)
-  if err != nil {
-    return 0, fmt.Errorf("marshal: %w", err)
-  }
-  if err := stub.PutState(key, out); err != nil {
-    return 0, fmt.Errorf("put state: %w", err)
-  }
-
-  // Emit lightweight event for off-chain listeners (keeps on-chain small)
-  evt := fmt.Sprintf("%s|%s|%d|%s|%d", targetID, dim, outcome, cid, ts)
-  _ = stub.SetEvent("RatingAppended", []byte(evt))
-
-  return st.Score(), nil
+  return &st, nil
 }
 
-func (rc *ReputationContract) GetReputation(ctx contractapi.TransactionContextInterface,
-  targetID string, dim string) (*m.RepState, error) {
+// SubmitRating(targetID, dim, outcome(0|1), cid, ts)
+func (rc *ReputationContract) SubmitRating(ctx contractapi.TransactionContextInterface,
+  targetID, dim, outcomeStr, cid string, tsStr string) (int, error) {
 
+  // Parse inputs
+  outcomeInt, err := strconv.Atoi(outcomeStr)
+  if err != nil || (outcomeInt != 0 && outcomeInt != 1) {
+    return 0, errors.New("outcome must be '0' or '1'")
+  }
+  ts, err := strconv.ParseInt(tsStr, 10, 64)
+  if err != nil || ts <= 0 {
+    return 0, errors.New("invalid ts")
+  }
+
+  // Load current state
   key := makeKey(targetID, dim)
   b, err := ctx.GetStub().GetState(key)
   if err != nil {
-    return nil, fmt.Errorf("get state: %w", err)
+    return 0, err
   }
-  if b == nil {
-    st := &m.RepState{ActorID: targetID, Dim: dim, Alpha: 0, Beta: 0, LastTs: 0}
-    return st, nil
+  st := m.ReputationState{ActorID: targetID, Dim: dim, Alpha: 0, Beta: 0, LastTs: 0}
+  if len(b) != 0 {
+    if err := json.Unmarshal(b, &st); err != nil {
+      return 0, err
+    }
   }
-  var st m.RepState
-  if err := json.Unmarshal(b, &st); err != nil {
-    return nil, fmt.Errorf("unmarshal: %w", err)
+
+  // Time-decay (only forward in time)
+  if st.LastTs > 0 && ts > st.LastTs {
+    dt := ts - st.LastTs
+    decay := math.Pow(defaultLambda, float64(dt))
+    st.Alpha *= decay
+    st.Beta *= decay
   }
-  return &st, nil
+
+  // Binary update
+  if outcomeInt == 1 {
+    st.Alpha += 1.0
+  } else {
+    st.Beta += 1.0
+  }
+  st.LastTs = ts
+
+  // Persist
+  out, err := json.Marshal(&st)
+  if err != nil {
+    return 0, err
+  }
+  if err := ctx.GetStub().PutState(key, out); err != nil {
+    return 0, err
+  }
+
+  // For now we just return 1 to signal success
+  return 1, nil
 }
