@@ -11,6 +11,8 @@
   "license": "ISC",
   "dependencies": {
     "@grpc/grpc-js": "^1.13.4",
-    "@hyperledger/fabric-gateway": "^1.8.0"
+    "@hyperledger/fabric-gateway": "^1.8.0",
+    "fabric-ca-client": "2.2",
+    "fabric-network": "2.2"
   }
 }

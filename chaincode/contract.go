@@ -3,89 +3,16 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
 )
 
 // ============================================================================
-// DATA STRUCTURES
-// ============================================================================
-
-// Reputation stores Beta distribution parameters for each (actor, dimension)
-type Reputation struct {
-	ActorID     string  `json:"actorId"`
-	Dimension   string  `json:"dimension"`
-	Alpha       float64 `json:"alpha"`        // Success count
-	Beta        float64 `json:"beta"`         // Failure count
-	LastTs      int64   `json:"lastTs"`       // Last update timestamp
-	TotalEvents int64   `json:"totalEvents"`  // Total ratings received
-}
-
-// Rating represents a single rating event
-type Rating struct {
-	RatingID  string  `json:"ratingId"`  // Unique ID
-	RaterID   string  `json:"raterId"`   // Who is rating
-	ActorID   string  `json:"actorId"`   // Who is being rated
-	Dimension string  `json:"dimension"` // quality, delivery, compliance, etc.
-	Value     float64 `json:"value"`     // 0.0-1.0 (0=failure, 1=success)
-	Weight    float64 `json:"weight"`    // Rater's weight (based on their reputation)
-	Evidence  string  `json:"evidence"`  // CID or hash of off-chain evidence
-	Timestamp int64   `json:"timestamp"`
-	TxID      string  `json:"txId"` // Transaction ID for auditability
-}
-
-// Stake represents locked capital for a rater
-type Stake struct {
-	RaterID      string  `json:"raterId"`
-	Amount       float64 `json:"amount"`
-	LockedAmount float64 `json:"lockedAmount"` // Amount locked in pending ratings
-	LastUpdated  int64   `json:"lastUpdated"`
-}
-
-// Dispute represents a challenged rating
-type Dispute struct {
-	DisputeID    string `json:"disputeId"`
-	RatingID     string `json:"ratingId"`
-	Challenger   string `json:"challenger"`
-	Reason       string `json:"reason"`
-	Evidence     string `json:"evidence"`
-	Status       string `json:"status"`       // pending, resolved
-	Verdict      string `json:"verdict"`      // upheld, overturned
-	ArbitratorID string `json:"arbitratorId"`
-	Timestamp    int64  `json:"timestamp"`
-	ResolvedTs   int64  `json:"resolvedTs"`
-}
-
-// SystemMetrics tracks overall system statistics for KPI analysis
-type SystemMetrics struct {
-	TotalRatings       int64   `json:"totalRatings"`
-	TotalDisputes      int64   `json:"totalDisputes"`
-	DisputesUpheld     int64   `json:"disputesUpheld"`
-	DisputesOverturned int64   `json:"disputesOverturned"`
-	TotalStakeSlashed  float64 `json:"totalStakeSlashed"`
-	TotalActors        int64   `json:"totalActors"`
-	LastUpdated        int64   `json:"lastUpdated"`
-}
-
-// AttackEvent logs detected suspicious activity for analysis
-type AttackEvent struct {
-	EventID     string   `json:"eventId"`
-	EventType   string   `json:"eventType"`  // sybil, collusion, bribery
-	ActorIDs    []string `json:"actorIds"`   // Involved actors
-	Confidence  float64  `json:"confidence"` // Detection confidence 0-1
-	Description string   `json:"description"`
-	Timestamp   int64    `json:"timestamp"`
-	Detected    bool     `json:"detected"`
-}
-
-// ============================================================================
-// CONTRACT
+// SMART CONTRACT DEFINITION
 // ============================================================================
 
 type ReputationContract struct {
@@ -93,278 +20,859 @@ type ReputationContract struct {
 }
 
 // ============================================================================
-// CONFIGURATION PARAMETERS (Tunable via MARL optimization)
+// DATA STRUCTURES
 // ============================================================================
 
-const (
-	// Reputation parameters
-	DecayRate        = 0.98  // λ - time decay factor
-	DecayPeriod      = 86400 // Decay period in seconds (1 day)
-	MinStakeRequired = 1000.0 // Minimum stake to submit ratings
-	MaxRaterWeight   = 5.0   // Maximum weight a rater can have
-	MinRaterWeight   = 0.1   // Minimum weight for new/low-rep raters
+// SystemConfig holds all governable parameters
+type SystemConfig struct {
+	// Economic Parameters
+	MinStakeRequired float64 `json:"minStakeRequired"`
+	DisputeCost      float64 `json:"disputeCost"`
+	SlashPercentage  float64 `json:"slashPercentage"`
 
-	// Attack detection thresholds
-	SybilThreshold     = 0.15 // Variance threshold for sybil detection
-	CollusionThreshold = 0.20 // Correlation threshold for collusion
+	// Reputation Parameters
+	DecayRate    float64 `json:"decayRate"`
+	DecayPeriod  float64 `json:"decayPeriod"`
+	InitialAlpha float64 `json:"initialAlpha"`
+	InitialBeta  float64 `json:"initialBeta"`
+	MinRaterWeight float64 `json:"minRaterWeight"`
+	MaxRaterWeight float64 `json:"maxRaterWeight"`
 
-	// Dispute parameters
-	DisputeCost     = 100.0 // Cost to initiate dispute
-	SlashPercentage = 0.30  // % of stake slashed if rating overturned
-)
+	// Dimension Registry
+	ValidDimensions map[string]bool   `json:"validDimensions"`
+	MetaDimensions  map[string]string `json:"metaDimensions"` // base -> meta mapping
+
+	// Version Control
+	Version     int   `json:"version"`
+	LastUpdated int64 `json:"lastUpdated"`
+}
+
+// Reputation represents the Beta distribution parameters
+type Reputation struct {
+	ActorID     string  `json:"actorId"`
+	Dimension   string  `json:"dimension"`
+	Alpha       float64 `json:"alpha"`
+	Beta        float64 `json:"beta"`
+	TotalEvents int     `json:"totalEvents"`
+	LastTs      int64   `json:"lastTs"`
+}
+
+// Rating represents a single rating event
+type Rating struct {
+	RatingID  string  `json:"ratingId"`
+	RaterID   string  `json:"raterId"`
+	ActorID   string  `json:"actorId"`
+	Dimension string  `json:"dimension"`
+	Value     float64 `json:"value"`
+	Weight    float64 `json:"weight"`
+	Evidence  string  `json:"evidence"`
+	Timestamp int64   `json:"timestamp"`
+	TxID      string  `json:"txId"`
+}
+
+// Stake represents an actor's financial commitment
+type Stake struct {
+	ActorID   string  `json:"actorId"`
+	Balance   float64 `json:"balance"`
+	Locked    float64 `json:"locked"`
+	UpdatedAt int64   `json:"updatedAt"`
+}
+
+// Dispute represents a challenge to a rating
+type Dispute struct {
+	DisputeID       string `json:"disputeId"`
+	RatingID        string `json:"ratingId"`
+	InitiatorID     string `json:"initiatorId"`
+	RaterID         string `json:"raterId"`
+	ActorID         string `json:"actorId"`
+	Dimension       string `json:"dimension"`
+	Reason          string `json:"reason"`
+	Status          string `json:"status"` // pending, upheld, overturned
+	ArbitratorID    string `json:"arbitratorId"`
+	ArbitratorNotes string `json:"arbitratorNotes"`
+	CreatedAt       int64  `json:"createdAt"`
+	ResolvedAt      int64  `json:"resolvedAt"`
+}
 
 // ============================================================================
-// COMPOSITE KEYS
+// GOVERNANCE FUNCTIONS
 // ============================================================================
 
-const (
-	prefixReputation  = "REP"
-	prefixRating      = "RAT"
-	prefixStake       = "STK"
-	prefixDispute     = "DIS"
-	prefixMetrics     = "MET"
-	prefixAttackEvent = "ATK"
-)
-
-func reputationKey(ctx contractapi.TransactionContextInterface, actorID, dimension string) (string, error) {
-	return ctx.GetStub().CreateCompositeKey(prefixReputation, []string{actorID, dimension})
-}
-
-func ratingKey(ctx contractapi.TransactionContextInterface, ratingID string) (string, error) {
-	return ctx.GetStub().CreateCompositeKey(prefixRating, []string{ratingID})
-}
-
-func stakeKey(ctx contractapi.TransactionContextInterface, raterID string) (string, error) {
-	return ctx.GetStub().CreateCompositeKey(prefixStake, []string{raterID})
-}
-
-func disputeKey(ctx contractapi.TransactionContextInterface, disputeID string) (string, error) {
-	return ctx.GetStub().CreateCompositeKey(prefixDispute, []string{disputeID})
-}
-
-func metricsKey(ctx contractapi.TransactionContextInterface) (string, error) {
-	return ctx.GetStub().CreateCompositeKey(prefixMetrics, []string{"global"})
-}
-
-func attackEventKey(ctx contractapi.TransactionContextInterface, eventID string) (string, error) {
-	return ctx.GetStub().CreateCompositeKey(prefixAttackEvent, []string{eventID})
-}
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-func trim(s string) string { return strings.TrimSpace(s) }
-
-func getOrInitReputation(ctx contractapi.TransactionContextInterface, actorID, dimension string) (*Reputation, error) {
-	key, err := reputationKey(ctx, actorID, dimension)
+// InitConfig initializes the system configuration with default values
+func (rc *ReputationContract) InitConfig(ctx contractapi.TransactionContextInterface) error {
+	// Check if config already exists
+	existing, err := ctx.GetStub().GetState("SYSTEM_CONFIG")
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to read config: %v", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("config already initialized")
 	}
 
-	raw, err := ctx.GetStub().GetState(key)
+	// Allow anyone to initialize if config doesn't exist (bootstrap)
+	// After initialization, only admins can update via UpdateConfig
+
+	config := SystemConfig{
+		MinStakeRequired: 10000.0,
+		DisputeCost:      100.0,
+		SlashPercentage:  0.1,
+		DecayRate:        0.98,
+		DecayPeriod:      86400.0, // 1 day in seconds
+		InitialAlpha:     2.0,
+		InitialBeta:      2.0,
+		MinRaterWeight:   0.1,
+		MaxRaterWeight:   5.0,
+		ValidDimensions: map[string]bool{
+			"quality":    true,
+			"delivery":   true,
+			"compliance": true,
+			"warranty":   true,
+		},
+		MetaDimensions: map[string]string{
+			"quality":    "rating_quality",
+			"delivery":   "rating_delivery",
+			"compliance": "rating_compliance",
+			"warranty":   "rating_warranty",
+		},
+		Version:     1,
+		LastUpdated: time.Now().Unix(),
+	}
+
+	configJSON, err := json.Marshal(config)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to marshal config: %v", err)
 	}
 
-	if len(raw) == 0 {
-		// Initialize with uniform prior (1,1)
-		return &Reputation{
-			ActorID:     actorID,
-			Dimension:   dimension,
-			Alpha:       1.0,
-			Beta:        1.0,
-			LastTs:      time.Now().Unix(),
-			TotalEvents: 0,
-		}, nil
+	err = ctx.GetStub().PutState("SYSTEM_CONFIG", configJSON)
+	if err != nil {
+		return fmt.Errorf("failed to store config: %v", err)
 	}
 
-	var rep Reputation
-	if err := json.Unmarshal(raw, &rep); err != nil {
-		return nil, err
-	}
-	return &rep, nil
+	// Emit event
+	ctx.GetStub().SetEvent("ConfigInitialized", configJSON)
+
+	return nil
 }
 
-func putState(ctx contractapi.TransactionContextInterface, key string, value interface{}) error {
-	bytes, err := json.Marshal(value)
+// UpdateConfig allows admin to modify system parameters
+func (rc *ReputationContract) UpdateConfig(
+	ctx contractapi.TransactionContextInterface,
+	configJSON string,
+) error {
+	if !isAdmin(ctx) {
+		return fmt.Errorf("unauthorized: admin role required")
+	}
+
+	var newConfig SystemConfig
+	if err := json.Unmarshal([]byte(configJSON), &newConfig); err != nil {
+		return fmt.Errorf("invalid config JSON: %v", err)
+	}
+
+	// Validate new config
+	if err := validateConfig(&newConfig); err != nil {
+		return fmt.Errorf("invalid configuration: %v", err)
+	}
+
+	newConfig.Version++
+	newConfig.LastUpdated = time.Now().Unix()
+
+	updatedJSON, err := json.Marshal(newConfig)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %v", err)
+	}
+
+	err = ctx.GetStub().PutState("SYSTEM_CONFIG", updatedJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update config: %v", err)
+	}
+
+	// Emit event
+	ctx.GetStub().SetEvent("ConfigUpdated", updatedJSON)
+
+	return nil
+}
+
+// GetConfig retrieves current system configuration
+func (rc *ReputationContract) GetConfig(ctx contractapi.TransactionContextInterface) (*SystemConfig, error) {
+	return getConfig(ctx)
+}
+
+// AddDimension allows admin to add a new reputation dimension
+func (rc *ReputationContract) AddDimension(
+	ctx contractapi.TransactionContextInterface,
+	baseDimension string,
+	metaDimension string,
+) error {
+	if !isAdmin(ctx) {
+		return fmt.Errorf("unauthorized: admin role required")
+	}
+
+	config, err := getConfig(ctx)
 	if err != nil {
 		return err
 	}
-	return ctx.GetStub().PutState(key, bytes)
+
+	// Add dimension
+	config.ValidDimensions[baseDimension] = true
+	config.MetaDimensions[baseDimension] = metaDimension
+	config.Version++
+	config.LastUpdated = time.Now().Unix()
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %v", err)
+	}
+
+	err = ctx.GetStub().PutState("SYSTEM_CONFIG", configJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update config: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"baseDimension": baseDimension,
+		"metaDimension": metaDimension,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("DimensionAdded", eventJSON)
+
+	return nil
 }
 
-func getState(ctx contractapi.TransactionContextInterface, key string, result interface{}) error {
-	bytes, err := ctx.GetStub().GetState(key)
+// ============================================================================
+// STAKE MANAGEMENT
+// ============================================================================
+
+// AddStake allows an actor to add financial stake
+func (rc *ReputationContract) AddStake(
+	ctx contractapi.TransactionContextInterface,
+	amountStr string,
+) error {
+	amount, err := strconv.ParseFloat(amountStr, 64)
+	if err != nil || amount <= 0 {
+		return fmt.Errorf("invalid amount: must be positive number")
+	}
+
+	actorID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return fmt.Errorf("failed to get actor ID: %v", err)
+	}
+
+	// Load or initialize stake
+	stake, err := getOrInitStake(ctx, actorID)
 	if err != nil {
 		return err
 	}
-	if len(bytes) == 0 {
-		return fmt.Errorf("not found: %s", key)
+
+	// Update balance
+	stake.Balance += amount
+	stake.UpdatedAt = time.Now().Unix()
+
+	// Store updated stake
+	stakeJSON, err := json.Marshal(stake)
+	if err != nil {
+		return fmt.Errorf("failed to marshal stake: %v", err)
 	}
-	return json.Unmarshal(bytes, result)
+
+	stakeKey := fmt.Sprintf("STAKE:%s", actorID)
+	err = ctx.GetStub().PutState(stakeKey, stakeJSON)
+	if err != nil {
+		return fmt.Errorf("failed to store stake: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"actorId": actorID,
+		"amount":  amount,
+		"balance": stake.Balance,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("StakeAdded", eventJSON)
+
+	return nil
+}
+
+// GetStake retrieves an actor's stake information
+func (rc *ReputationContract) GetStake(
+	ctx contractapi.TransactionContextInterface,
+	actorID string,
+) (*Stake, error) {
+	return getOrInitStake(ctx, actorID)
 }
 
 // ============================================================================
-// CORE REPUTATION LOGIC
+// RATING SUBMISSION
 // ============================================================================
 
-// SubmitRating - Main transaction for submitting ratings
+// SubmitRating allows an actor to rate another actor
 func (rc *ReputationContract) SubmitRating(
 	ctx contractapi.TransactionContextInterface,
-	actorID string,   // Who is being rated
-	dimension string, // quality, delivery, compliance, warranty
-	valueStr string,  // 0.0-1.0 (success probability)
-	evidence string,  // CID/hash of off-chain evidence
-	timestampStr string, // Unix timestamp
+	actorID string,
+	dimension string,
+	valueStr string,
+	evidence string,
+	timestampStr string,
 ) (string, error) {
-	// Input validation
-	actorID = trim(actorID)
-	dimension = trim(dimension)
-	evidence = trim(evidence)
-
-	if actorID == "" || dimension == "" {
-		return "", errors.New("actorID and dimension required")
-	}
-
-	value, err := strconv.ParseFloat(trim(valueStr), 64)
+	// Parse inputs
+	value, err := strconv.ParseFloat(valueStr, 64)
 	if err != nil || value < 0 || value > 1 {
-		return "", errors.New("value must be between 0 and 1")
+		return "", fmt.Errorf("invalid value: must be between 0 and 1")
 	}
 
-	timestamp, err := strconv.ParseInt(trim(timestampStr), 10, 64)
+	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
-		timestamp = time.Now().Unix()
+		return "", fmt.Errorf("invalid timestamp: %v", err)
 	}
 
-	// Get rater identity
+	// Get rater ID
 	raterID, err := ctx.GetClientIdentity().GetID()
 	if err != nil {
-		return "", fmt.Errorf("failed to get rater identity: %w", err)
+		return "", fmt.Errorf("failed to get rater ID: %v", err)
 	}
 
-	// Check if rater has sufficient stake
-	stakeObj, err := rc.getOrInitStake(ctx, raterID)
+	// CRITICAL: Prevent self-rating
+	if raterID == actorID {
+		return "", fmt.Errorf("self-rating is not allowed")
+	}
+
+	// Validate dimension
+	config, err := getConfig(ctx)
 	if err != nil {
 		return "", err
 	}
 
-	if stakeObj.Amount-stakeObj.LockedAmount < MinStakeRequired {
-		return "", fmt.Errorf("insufficient stake: need %.2f, have %.2f available",
-			MinStakeRequired, stakeObj.Amount-stakeObj.LockedAmount)
+	if !config.ValidDimensions[dimension] {
+		return "", fmt.Errorf("invalid dimension: %s", dimension)
 	}
 
-	// Calculate rater's weight based on their reputation
-	raterWeight, err := rc.calculateRaterWeight(ctx, raterID, dimension)
+	// Check rater has minimum stake
+	raterStake, err := getOrInitStake(ctx, raterID)
 	if err != nil {
 		return "", err
 	}
 
-	// Generate unique rating ID
+	if raterStake.Balance < config.MinStakeRequired {
+		return "", fmt.Errorf("insufficient stake: minimum %f required", config.MinStakeRequired)
+	}
+
+	// Calculate rater weight based on METAREPUTATION
+	weight, err := rc.calculateRaterWeight(ctx, raterID, dimension)
+	if err != nil {
+		return "", fmt.Errorf("failed to calculate rater weight: %v", err)
+	}
+
+	// Generate rating ID
 	txID := ctx.GetStub().GetTxID()
 	ratingID := generateRatingID(raterID, actorID, dimension, timestamp)
 
-	// Check for duplicate (idempotency)
-	rKey, _ := ratingKey(ctx, ratingID)
-	existing, _ := ctx.GetStub().GetState(rKey)
-	if len(existing) > 0 {
-		return ratingID, nil // Already processed
-	}
-
-	// Load current reputation with time decay
-	rep, err := getOrInitReputation(ctx, actorID, dimension)
-	if err != nil {
-		return "", err
-	}
-
-	// Apply time decay
-	timeSinceLastUpdate := float64(timestamp - rep.LastTs)
-	decayFactor := math.Pow(DecayRate, timeSinceLastUpdate/DecayPeriod)
-	rep.Alpha *= decayFactor
-	rep.Beta *= decayFactor
-
-	// Update with new rating (weighted)
-	if value >= 0.5 {
-		rep.Alpha += raterWeight * value
-	} else {
-		rep.Beta += raterWeight * (1.0 - value)
-	}
-	rep.LastTs = timestamp
-	rep.TotalEvents++
-
-	// Store rating record
+	// Create rating record
 	rating := Rating{
 		RatingID:  ratingID,
 		RaterID:   raterID,
 		ActorID:   actorID,
 		Dimension: dimension,
 		Value:     value,
-		Weight:    raterWeight,
+		Weight:    weight,
 		Evidence:  evidence,
 		Timestamp: timestamp,
 		TxID:      txID,
 	}
 
-	rKey, _ = ratingKey(ctx, ratingID)
-	if err := putState(ctx, rKey, &rating); err != nil {
-		return "", err
+	// Store rating
+	ratingJSON, err := json.Marshal(rating)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal rating: %v", err)
 	}
 
-	// Store updated reputation
-	repKey, _ := reputationKey(ctx, actorID, dimension)
-	if err := putState(ctx, repKey, rep); err != nil {
-		return "", err
+	err = ctx.GetStub().PutState(ratingID, ratingJSON)
+	if err != nil {
+		return "", fmt.Errorf("failed to store rating: %v", err)
 	}
 
-	// Update system metrics
-	if err := rc.incrementMetrics(ctx, "rating"); err != nil {
-		// Log but don't fail transaction
-		fmt.Printf("Warning: failed to update metrics: %v\n", err)
+	// Update actor's reputation
+	err = rc.updateReputation(ctx, &rating)
+	if err != nil {
+		return "", fmt.Errorf("failed to update reputation: %v", err)
 	}
 
-	// Detect potential attacks
-	rc.detectAnomalies(ctx, actorID, raterID, dimension, value)
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"ratingId":  ratingID,
+		"raterId":   raterID,
+		"actorId":   actorID,
+		"dimension": dimension,
+		"value":     value,
+		"weight":    weight,
+		"timestamp": timestamp,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("RatingSubmitted", eventJSON)
 
 	return ratingID, nil
 }
 
-// GetReputation - Query reputation score with confidence interval
+// updateReputation updates the actor's Beta distribution parameters
+func (rc *ReputationContract) updateReputation(
+	ctx contractapi.TransactionContextInterface,
+	rating *Rating,
+) error {
+	config, err := getConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Load or initialize reputation
+	rep, err := getOrInitReputation(ctx, rating.ActorID, rating.Dimension, config)
+	if err != nil {
+		return err
+	}
+
+	// Update Beta parameters with weighted rating
+	if rating.Value >= 0.5 {
+		rep.Alpha += rating.Weight * rating.Value
+	} else {
+		rep.Beta += rating.Weight * (1.0 - rating.Value)
+	}
+
+	rep.TotalEvents++
+	rep.LastTs = time.Now().Unix()
+
+	// Store updated reputation
+	repKey := fmt.Sprintf("REPUTATION:%s:%s", rating.ActorID, rating.Dimension)
+	repJSON, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("failed to marshal reputation: %v", err)
+	}
+
+	err = ctx.GetStub().PutState(repKey, repJSON)
+	if err != nil {
+		return fmt.Errorf("failed to store reputation: %v", err)
+	}
+
+	// Emit event
+	score := rep.Alpha / (rep.Alpha + rep.Beta)
+	eventPayload := map[string]interface{}{
+		"actorId":     rating.ActorID,
+		"dimension":   rating.Dimension,
+		"newScore":    score,
+		"totalEvents": rep.TotalEvents,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("ReputationUpdated", eventJSON)
+
+	return nil
+}
+
+// calculateRaterWeight computes the rater's influence based on METAREPUTATION
+func (rc *ReputationContract) calculateRaterWeight(
+	ctx contractapi.TransactionContextInterface,
+	raterID string,
+	baseDimension string,
+) (float64, error) {
+	config, err := getConfig(ctx)
+	if err != nil {
+		return config.MinRaterWeight, err
+	}
+
+	// Get the META-dimension (e.g., "quality" -> "rating_quality")
+	metaDimension, exists := config.MetaDimensions[baseDimension]
+	if !exists {
+		return config.MinRaterWeight, fmt.Errorf("no meta-dimension for %s", baseDimension)
+	}
+
+	// Load rater's METAREPUTATION (their ability to rate this dimension)
+	rep, err := getOrInitReputation(ctx, raterID, metaDimension, config)
+	if err != nil {
+		return config.MinRaterWeight, err
+	}
+
+	// Apply dynamic time decay
+	effectiveRep := applyDynamicDecay(rep, config)
+
+	// Calculate metareputation score
+	metaScore := effectiveRep.Alpha / (effectiveRep.Alpha + effectiveRep.Beta)
+
+	// Calculate confidence factor
+	totalEvents := effectiveRep.Alpha + effectiveRep.Beta
+	confidenceFactor := 1.0 + math.Sqrt(totalEvents/(totalEvents+10.0))
+
+	// Calculate weight
+	weight := metaScore * confidenceFactor
+
+	// Apply bounds
+	if weight < config.MinRaterWeight {
+		weight = config.MinRaterWeight
+	}
+	if weight > config.MaxRaterWeight {
+		weight = config.MaxRaterWeight
+	}
+
+	return weight, nil
+}
+
+// ============================================================================
+// DISPUTE RESOLUTION
+// ============================================================================
+
+// InitiateDispute allows challenging a rating
+func (rc *ReputationContract) InitiateDispute(
+	ctx contractapi.TransactionContextInterface,
+	ratingID string,
+	reason string,
+) (string, error) {
+	initiatorID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return "", fmt.Errorf("failed to get initiator ID: %v", err)
+	}
+
+	// Load rating
+	ratingJSON, err := ctx.GetStub().GetState(ratingID)
+	if err != nil || ratingJSON == nil {
+		return "", fmt.Errorf("rating not found: %s", ratingID)
+	}
+
+	var rating Rating
+	if err := json.Unmarshal(ratingJSON, &rating); err != nil {
+		return "", fmt.Errorf("failed to unmarshal rating: %v", err)
+	}
+
+	// Check initiator is the rated actor
+	if initiatorID != rating.ActorID {
+		return "", fmt.Errorf("only the rated actor can dispute a rating")
+	}
+
+	// Check initiator has stake for dispute cost
+	config, err := getConfig(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	stake, err := getOrInitStake(ctx, initiatorID)
+	if err != nil {
+		return "", err
+	}
+
+	if stake.Balance < config.DisputeCost {
+		return "", fmt.Errorf("insufficient stake for dispute: %f required", config.DisputeCost)
+	}
+
+	// Lock dispute cost
+	stake.Balance -= config.DisputeCost
+	stake.Locked += config.DisputeCost
+	stake.UpdatedAt = time.Now().Unix()
+
+	stakeKey := fmt.Sprintf("STAKE:%s", initiatorID)
+	stakeJSON, _ := json.Marshal(stake)
+	ctx.GetStub().PutState(stakeKey, stakeJSON)
+
+	// Create dispute
+	disputeID := generateDisputeID(ratingID, initiatorID, time.Now().Unix())
+	dispute := Dispute{
+		DisputeID:   disputeID,
+		RatingID:    ratingID,
+		InitiatorID: initiatorID,
+		RaterID:     rating.RaterID,
+		ActorID:     rating.ActorID,
+		Dimension:   rating.Dimension,
+		Reason:      reason,
+		Status:      "pending",
+		CreatedAt:   time.Now().Unix(),
+	}
+
+	disputeJSON, err := json.Marshal(dispute)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal dispute: %v", err)
+	}
+
+	err = ctx.GetStub().PutState(disputeID, disputeJSON)
+	if err != nil {
+		return "", fmt.Errorf("failed to store dispute: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"disputeId":   disputeID,
+		"ratingId":    ratingID,
+		"initiatorId": initiatorID,
+		"reason":      reason,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("DisputeInitiated", eventJSON)
+
+	return disputeID, nil
+}
+
+// ResolveDispute allows arbitrator to resolve a dispute
+func (rc *ReputationContract) ResolveDispute(
+	ctx contractapi.TransactionContextInterface,
+	disputeID string,
+	verdict string,
+	arbitratorNotes string,
+) error {
+	// Validate verdict
+	if verdict != "upheld" && verdict != "overturned" {
+		return fmt.Errorf("verdict must be 'upheld' or 'overturned'")
+	}
+
+	// Check arbitrator role
+	if !isArbitrator(ctx) {
+		return fmt.Errorf("unauthorized: arbitrator role required")
+	}
+
+	// Load dispute
+	disputeJSON, err := ctx.GetStub().GetState(disputeID)
+	if err != nil || disputeJSON == nil {
+		return fmt.Errorf("dispute not found: %s", disputeID)
+	}
+
+	var dispute Dispute
+	if err := json.Unmarshal(disputeJSON, &dispute); err != nil {
+		return fmt.Errorf("failed to unmarshal dispute: %v", err)
+	}
+
+	if dispute.Status != "pending" {
+		return fmt.Errorf("dispute already resolved")
+	}
+
+	// Get arbitrator ID
+	arbitratorID, _ := ctx.GetClientIdentity().GetID()
+
+	// Update dispute record
+	dispute.Status = verdict
+	dispute.ArbitratorID = arbitratorID
+	dispute.ArbitratorNotes = arbitratorNotes
+	dispute.ResolvedAt = time.Now().Unix()
+
+	// Determine if rater was correct
+	raterWasCorrect := (verdict == "upheld")
+
+	// CRITICAL: UPDATE METAREPUTATION
+	err = rc.updateMetaReputation(ctx, dispute.RaterID, dispute.Dimension, raterWasCorrect)
+	if err != nil {
+		return fmt.Errorf("failed to update metareputation: %v", err)
+	}
+
+	// If overturned, reverse the rating's effect
+	if verdict == "overturned" {
+		err = rc.reverseRating(ctx, dispute.RatingID)
+		if err != nil {
+			return fmt.Errorf("failed to reverse rating: %v", err)
+		}
+
+		// Slash rater's stake
+		err = rc.slashStake(ctx, dispute.RaterID)
+		if err != nil {
+			return fmt.Errorf("failed to slash stake: %v", err)
+		}
+	}
+
+	// Return dispute cost to initiator
+	config, _ := getConfig(ctx)
+	stake, _ := getOrInitStake(ctx, dispute.InitiatorID)
+	stake.Locked -= config.DisputeCost
+	stake.Balance += config.DisputeCost
+	stake.UpdatedAt = time.Now().Unix()
+
+	stakeKey := fmt.Sprintf("STAKE:%s", dispute.InitiatorID)
+	stakeJSON, _ := json.Marshal(stake)
+	ctx.GetStub().PutState(stakeKey, stakeJSON)
+
+	// Store updated dispute
+	updatedDisputeJSON, _ := json.Marshal(dispute)
+	ctx.GetStub().PutState(disputeID, updatedDisputeJSON)
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"disputeId":       disputeID,
+		"verdict":         verdict,
+		"raterWasCorrect": raterWasCorrect,
+		"dimension":       dispute.Dimension,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("DisputeResolved", eventJSON)
+
+	return nil
+}
+
+// updateMetaReputation updates rater's ability to rate others
+func (rc *ReputationContract) updateMetaReputation(
+	ctx contractapi.TransactionContextInterface,
+	raterID string,
+	baseDimension string,
+	wasCorrect bool,
+) error {
+	config, err := getConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Get meta-dimension
+	metaDimension, exists := config.MetaDimensions[baseDimension]
+	if !exists {
+		return fmt.Errorf("no meta-dimension for %s", baseDimension)
+	}
+
+	// Load or initialize metareputation
+	rep, err := getOrInitReputation(ctx, raterID, metaDimension, config)
+	if err != nil {
+		return err
+	}
+
+	// Update based on dispute outcome
+	if wasCorrect {
+		rep.Alpha += 1.0 // Rater was right
+	} else {
+		rep.Beta += 1.0 // Rater was wrong
+	}
+
+	rep.LastTs = time.Now().Unix()
+	rep.TotalEvents++
+
+	// Store updated metareputation
+	repKey := fmt.Sprintf("REPUTATION:%s:%s", raterID, metaDimension)
+	repJSON, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metareputation: %v", err)
+	}
+
+	return ctx.GetStub().PutState(repKey, repJSON)
+}
+
+// reverseRating undoes the effect of an overturned rating
+func (rc *ReputationContract) reverseRating(
+	ctx contractapi.TransactionContextInterface,
+	ratingID string,
+) error {
+	// Load rating
+	ratingJSON, err := ctx.GetStub().GetState(ratingID)
+	if err != nil || ratingJSON == nil {
+		return fmt.Errorf("rating not found: %s", ratingID)
+	}
+
+	var rating Rating
+	if err := json.Unmarshal(ratingJSON, &rating); err != nil {
+		return fmt.Errorf("failed to unmarshal rating: %v", err)
+	}
+
+	config, _ := getConfig(ctx)
+
+	// Load actor's reputation
+	rep, err := getOrInitReputation(ctx, rating.ActorID, rating.Dimension, config)
+	if err != nil {
+		return err
+	}
+
+	// Reverse the effect
+	if rating.Value >= 0.5 {
+		rep.Alpha -= rating.Weight * rating.Value
+	} else {
+		rep.Beta -= rating.Weight * (1.0 - rating.Value)
+	}
+
+	// Ensure non-negative
+	if rep.Alpha < config.InitialAlpha {
+		rep.Alpha = config.InitialAlpha
+	}
+	if rep.Beta < config.InitialBeta {
+		rep.Beta = config.InitialBeta
+	}
+
+	rep.TotalEvents--
+
+	// Store updated reputation
+	repKey := fmt.Sprintf("REPUTATION:%s:%s", rating.ActorID, rating.Dimension)
+	repJSON, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("failed to marshal reputation: %v", err)
+	}
+
+	return ctx.GetStub().PutState(repKey, repJSON)
+}
+
+// slashStake penalizes rater for false rating
+func (rc *ReputationContract) slashStake(
+	ctx contractapi.TransactionContextInterface,
+	raterID string,
+) error {
+	config, err := getConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	stake, err := getOrInitStake(ctx, raterID)
+	if err != nil {
+		return err
+	}
+
+	slashAmount := stake.Balance * config.SlashPercentage
+	stake.Balance -= slashAmount
+	stake.UpdatedAt = time.Now().Unix()
+
+	stakeKey := fmt.Sprintf("STAKE:%s", raterID)
+	stakeJSON, err := json.Marshal(stake)
+	if err != nil {
+		return fmt.Errorf("failed to marshal stake: %v", err)
+	}
+
+	err = ctx.GetStub().PutState(stakeKey, stakeJSON)
+	if err != nil {
+		return fmt.Errorf("failed to store stake: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"raterId":     raterID,
+		"slashAmount": slashAmount,
+		"newBalance":  stake.Balance,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("StakeSlashed", eventJSON)
+
+	return nil
+}
+
+// ============================================================================
+// QUERY FUNCTIONS (CouchDB Indexed)
+// ============================================================================
+
+// GetReputation retrieves an actor's reputation with dynamic decay applied
 func (rc *ReputationContract) GetReputation(
 	ctx contractapi.TransactionContextInterface,
 	actorID string,
 	dimension string,
 ) (map[string]interface{}, error) {
-	rep, err := getOrInitReputation(ctx, actorID, dimension)
+	config, err := getConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Apply time decay before returning score
-	now := time.Now().Unix()
-	timeSinceLastUpdate := float64(now - rep.LastTs)
-	decayFactor := math.Pow(DecayRate, timeSinceLastUpdate/DecayPeriod)
+	if !config.ValidDimensions[dimension] {
+		return nil, fmt.Errorf("invalid dimension: %s", dimension)
+	}
 
-	effectiveAlpha := rep.Alpha * decayFactor
-	effectiveBeta := rep.Beta * decayFactor
+	// Load reputation
+	rep, err := getOrInitReputation(ctx, actorID, dimension, config)
+	if err != nil {
+		return nil, err
+	}
 
-	// Point estimate (mean of Beta distribution)
-	score := effectiveAlpha / (effectiveAlpha + effectiveBeta)
+	// Apply dynamic decay
+	effectiveRep := applyDynamicDecay(rep, config)
 
-	// Confidence interval (Wilson score)
-	ci := calculateWilsonCI(effectiveAlpha, effectiveBeta, 0.95)
+	// Calculate score
+	score := effectiveRep.Alpha / (effectiveRep.Alpha + effectiveRep.Beta)
 
-	// Confidence level (based on sample size)
-	confidence := 1.0 - (1.0 / (1.0 + float64(rep.TotalEvents)))
+	// Calculate Wilson confidence interval
+	ci := calculateWilsonCI(effectiveRep.Alpha, effectiveRep.Beta, 0.95)
 
 	result := map[string]interface{}{
 		"actorId":     actorID,
 		"dimension":   dimension,
 		"score":       score,
-		"confidence":  confidence,
+		"alpha":       effectiveRep.Alpha,
+		"beta":        effectiveRep.Beta,
 		"ci_lower":    ci[0],
 		"ci_upper":    ci[1],
-		"alpha":       effectiveAlpha,
-		"beta":        effectiveBeta,
 		"totalEvents": rep.TotalEvents,
 		"lastUpdated": rep.LastTs,
 	}
@@ -372,363 +880,395 @@ func (rc *ReputationContract) GetReputation(
 	return result, nil
 }
 
+// GetRatingHistory retrieves all ratings for an actor (indexed query)
+func (rc *ReputationContract) GetRatingHistory(
+	ctx contractapi.TransactionContextInterface,
+	actorID string,
+	dimension string,
+) ([]Rating, error) {
+	// Construct CouchDB query
+	query := fmt.Sprintf(`{
+		"selector": {
+			"actorId": "%s",
+			"dimension": "%s"
+		},
+		"sort": [{"timestamp": "desc"}],
+		"limit": 100
+	}`, actorID, dimension)
+
+	resultsIterator, err := ctx.GetStub().GetQueryResult(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute query: %v", err)
+	}
+	defer resultsIterator.Close()
+
+	var ratings []Rating
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+
+		var rating Rating
+		if err := json.Unmarshal(queryResponse.Value, &rating); err != nil {
+			continue
+		}
+		ratings = append(ratings, rating)
+	}
+
+	return ratings, nil
+}
+
+//
+// GetDisputesByStatus retrieves disputes by status (indexed query)
+func (rc *ReputationContract) GetDisputesByStatus(
+	ctx contractapi.TransactionContextInterface,
+	status string,
+) ([]Dispute, error) {
+	// Construct CouchDB query
+	query := fmt.Sprintf(`{
+		"selector": {
+			"status": "%s"
+		},
+		"sort": [{"createdAt": "desc"}],
+		"limit": 100
+	}`, status)
+
+	resultsIterator, err := ctx.GetStub().GetQueryResult(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute query: %v", err)
+	}
+	defer resultsIterator.Close()
+
+	var disputes []Dispute
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+
+		var dispute Dispute
+		if err := json.Unmarshal(queryResponse.Value, &dispute); err != nil {
+			continue
+		}
+		disputes = append(disputes, dispute)
+	}
+
+	return disputes, nil
+}
+
+// GetActorsByDimension retrieves actors with reputation above threshold (indexed query)
+func (rc *ReputationContract) GetActorsByDimension(
+	ctx contractapi.TransactionContextInterface,
+	dimension string,
+	minScoreStr string,
+) ([]map[string]interface{}, error) {
+	minScore, err := strconv.ParseFloat(minScoreStr, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid minScore: %v", err)
+	}
+
+	// Construct CouchDB query
+	query := fmt.Sprintf(`{
+		"selector": {
+			"dimension": "%s"
+		},
+		"limit": 1000
+	}`, dimension)
+
+	resultsIterator, err := ctx.GetStub().GetQueryResult(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute query: %v", err)
+	}
+	defer resultsIterator.Close()
+
+	config, _ := getConfig(ctx)
+	var results []map[string]interface{}
+
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			continue
+		}
+
+		var rep Reputation
+		if err := json.Unmarshal(queryResponse.Value, &rep); err != nil {
+			continue
+		}
+
+		// Apply dynamic decay and calculate score
+		effectiveRep := applyDynamicDecay(&rep, config)
+		score := effectiveRep.Alpha / (effectiveRep.Alpha + effectiveRep.Beta)
+
+		// Filter by minimum score
+		if score >= minScore {
+			results = append(results, map[string]interface{}{
+				"actorId":   rep.ActorID,
+				"dimension": rep.Dimension,
+				"score":     score,
+			})
+		}
+	}
+
+	return results, nil
+}
+
+// GetRatingsByRater retrieves all ratings submitted by a rater (indexed query)
+func (rc *ReputationContract) GetRatingsByRater(
+	ctx contractapi.TransactionContextInterface,
+	raterID string,
+) ([]Rating, error) {
+	query := fmt.Sprintf(`{
+		"selector": {
+			"raterId": "%s"
+		},
+		"sort": [{"timestamp": "desc"}],
+		"limit": 100
+	}`, raterID)
+
+	resultsIterator, err := ctx.GetStub().GetQueryResult(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute query: %v", err)
+	}
+	defer resultsIterator.Close()
+
+	var ratings []Rating
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+
+		var rating Rating
+		if err := json.Unmarshal(queryResponse.Value, &rating); err != nil {
+			continue
+		}
+		ratings = append(ratings, rating)
+	}
+
+	return ratings, nil
+}
+
+// GetDispute retrieves a specific dispute
+func (rc *ReputationContract) GetDispute(
+	ctx contractapi.TransactionContextInterface,
+	disputeID string,
+) (*Dispute, error) {
+	disputeJSON, err := ctx.GetStub().GetState(disputeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read dispute: %v", err)
+	}
+	if disputeJSON == nil {
+		return nil, fmt.Errorf("dispute not found: %s", disputeID)
+	}
+
+	var dispute Dispute
+	if err := json.Unmarshal(disputeJSON, &dispute); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal dispute: %v", err)
+	}
+
+	return &dispute, nil
+}
+
+// GetRating retrieves a specific rating
+func (rc *ReputationContract) GetRating(
+	ctx contractapi.TransactionContextInterface,
+	ratingID string,
+) (*Rating, error) {
+	ratingJSON, err := ctx.GetStub().GetState(ratingID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rating: %v", err)
+	}
+	if ratingJSON == nil {
+		return nil, fmt.Errorf("rating not found: %s", ratingID)
+	}
+
+	var rating Rating
+	if err := json.Unmarshal(ratingJSON, &rating); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal rating: %v", err)
+	}
+
+	return &rating, nil
+}
+
 // ============================================================================
-// STAKING MECHANISM
+// HELPER FUNCTIONS
 // ============================================================================
 
-func (rc *ReputationContract) getOrInitStake(ctx contractapi.TransactionContextInterface, raterID string) (*Stake, error) {
-	key, _ := stakeKey(ctx, raterID)
-	var stake Stake
-	err := getState(ctx, key, &stake)
+// getConfig retrieves system configuration
+func getConfig(ctx contractapi.TransactionContextInterface) (*SystemConfig, error) {
+	configJSON, err := ctx.GetStub().GetState("SYSTEM_CONFIG")
 	if err != nil {
-		// Initialize new stake
-		return &Stake{
-			RaterID:      raterID,
-			Amount:       0,
-			LockedAmount: 0,
-			LastUpdated:  time.Now().Unix(),
+		return nil, fmt.Errorf("failed to read config: %v", err)
+	}
+	if configJSON == nil {
+		return nil, fmt.Errorf("system config not initialized")
+	}
+
+	var config SystemConfig
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config: %v", err)
+	}
+
+	return &config, nil
+}
+
+// validateConfig validates system configuration
+func validateConfig(config *SystemConfig) error {
+	if config.MinStakeRequired < 0 {
+		return fmt.Errorf("minStakeRequired must be non-negative")
+	}
+	if config.DisputeCost < 0 {
+		return fmt.Errorf("disputeCost must be non-negative")
+	}
+	if config.SlashPercentage < 0 || config.SlashPercentage > 1 {
+		return fmt.Errorf("slashPercentage must be between 0 and 1")
+	}
+	if config.DecayRate < 0 || config.DecayRate > 1 {
+		return fmt.Errorf("decayRate must be between 0 and 1")
+	}
+	if config.DecayPeriod <= 0 {
+		return fmt.Errorf("decayPeriod must be positive")
+	}
+	if config.InitialAlpha <= 0 || config.InitialBeta <= 0 {
+		return fmt.Errorf("initial alpha and beta must be positive")
+	}
+	if config.MinRaterWeight < 0 || config.MaxRaterWeight < config.MinRaterWeight {
+		return fmt.Errorf("invalid rater weight bounds")
+	}
+	if len(config.ValidDimensions) == 0 {
+		return fmt.Errorf("at least one valid dimension required")
+	}
+
+	return nil
+}
+
+// getOrInitReputation loads or initializes reputation
+func getOrInitReputation(
+	ctx contractapi.TransactionContextInterface,
+	actorID string,
+	dimension string,
+	config *SystemConfig,
+) (*Reputation, error) {
+	repKey := fmt.Sprintf("REPUTATION:%s:%s", actorID, dimension)
+	repJSON, err := ctx.GetStub().GetState(repKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read reputation: %v", err)
+	}
+
+	if repJSON == nil {
+		// Initialize new reputation
+		return &Reputation{
+			ActorID:     actorID,
+			Dimension:   dimension,
+			Alpha:       config.InitialAlpha,
+			Beta:        config.InitialBeta,
+			TotalEvents: 0,
+			LastTs:      time.Now().Unix(),
 		}, nil
 	}
+
+	var rep Reputation
+	if err := json.Unmarshal(repJSON, &rep); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal reputation: %v", err)
+	}
+
+	return &rep, nil
+}
+
+// getOrInitStake loads or initializes stake
+func getOrInitStake(
+	ctx contractapi.TransactionContextInterface,
+	actorID string,
+) (*Stake, error) {
+	stakeKey := fmt.Sprintf("STAKE:%s", actorID)
+	stakeJSON, err := ctx.GetStub().GetState(stakeKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read stake: %v", err)
+	}
+
+	if stakeJSON == nil {
+		// Initialize new stake
+		return &Stake{
+			ActorID:   actorID,
+			Balance:   0.0,
+			Locked:    0.0,
+			UpdatedAt: time.Now().Unix(),
+		}, nil
+	}
+
+	var stake Stake
+	if err := json.Unmarshal(stakeJSON, &stake); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal stake: %v", err)
+	}
+
 	return &stake, nil
 }
 
-// AddStake - Rater deposits stake to participate
-func (rc *ReputationContract) AddStake(
-	ctx contractapi.TransactionContextInterface,
-	amountStr string,
-) error {
-	raterID, _ := ctx.GetClientIdentity().GetID()
-	amount, err := strconv.ParseFloat(amountStr, 64)
-	if err != nil || amount <= 0 {
-		return errors.New("invalid amount")
-	}
-
-	stake, err := rc.getOrInitStake(ctx, raterID)
-	if err != nil {
-		return err
-	}
-
-	stake.Amount += amount
-	stake.LastUpdated = time.Now().Unix()
-
-	key, _ := stakeKey(ctx, raterID)
-	return putState(ctx, key, stake)
-}
-
-// SlashStake - Penalty for dishonest ratings (called by dispute resolution)
-func (rc *ReputationContract) SlashStake(
-	ctx contractapi.TransactionContextInterface,
-	raterID string,
-	amountStr string,
-) error {
-	amount, err := strconv.ParseFloat(amountStr, 64)
-	if err != nil || amount <= 0 {
-		return errors.New("invalid amount")
-	}
-
-	stake, err := rc.getOrInitStake(ctx, raterID)
-	if err != nil {
-		return err
-	}
-
-	if stake.Amount < amount {
-		amount = stake.Amount // Slash everything if insufficient
-	}
-
-	stake.Amount -= amount
-	stake.LastUpdated = time.Now().Unix()
-
-	key, _ := stakeKey(ctx, raterID)
-	if err := putState(ctx, key, stake); err != nil {
-		return err
-	}
-
-	// Update metrics
-	return rc.incrementMetrics(ctx, "slash")
-}
-
-// ============================================================================
-// DISPUTE MECHANISM
-// ============================================================================
-
-// InitiateDispute - Challenge a rating
-func (rc *ReputationContract) InitiateDispute(
-	ctx contractapi.TransactionContextInterface,
-	ratingID string,
-	reason string,
-	evidence string,
-) (string, error) {
-	challengerID, _ := ctx.GetClientIdentity().GetID()
-
-	// Check if rating exists
-	rKey, _ := ratingKey(ctx, ratingID)
-	var rating Rating
-	if err := getState(ctx, rKey, &rating); err != nil {
-		return "", fmt.Errorf("rating not found: %w", err)
-	}
-
-	// Check challenger has stake to cover dispute cost
-	stake, _ := rc.getOrInitStake(ctx, challengerID)
-	if stake.Amount < DisputeCost {
-		return "", fmt.Errorf("insufficient stake for dispute: need %.2f", DisputeCost)
-	}
-
-	// Create dispute
-	disputeID := generateDisputeID(ratingID, challengerID)
-	dispute := Dispute{
-		DisputeID:    disputeID,
-		RatingID:     ratingID,
-		Challenger:   challengerID,
-		Reason:       reason,
-		Evidence:     evidence,
-		Status:       "pending",
-		Verdict:      "",
-		ArbitratorID: "",
-		Timestamp:    time.Now().Unix(),
-		ResolvedTs:   0,
-	}
-
-	dKey, _ := disputeKey(ctx, disputeID)
-	if err := putState(ctx, dKey, &dispute); err != nil {
-		return "", err
-	}
-
-	rc.incrementMetrics(ctx, "dispute")
-
-	return disputeID, nil
-}
-
-// ResolveDispute - Arbitrator resolves dispute
-func (rc *ReputationContract) ResolveDispute(
-	ctx contractapi.TransactionContextInterface,
-	disputeID string,
-	verdict string, // "upheld" or "overturned"
-) error {
-	arbitratorID, _ := ctx.GetClientIdentity().GetID()
-
-	// Load dispute
-	dKey, _ := disputeKey(ctx, disputeID)
-	var dispute Dispute
-	if err := getState(ctx, dKey, &dispute); err != nil {
-		return err
-	}
-
-	if dispute.Status != "pending" {
-		return errors.New("dispute already resolved")
-	}
-
-	// Load original rating
-	rKey, _ := ratingKey(ctx, dispute.RatingID)
-	var rating Rating
-	if err := getState(ctx, rKey, &rating); err != nil {
-		return err
-	}
-
-	dispute.Verdict = verdict
-	dispute.Status = "resolved"
-	dispute.ArbitratorID = arbitratorID
-	dispute.ResolvedTs = time.Now().Unix()
-
-	if verdict == "overturned" {
-		// Slash rater's stake
-		slashAmount := MinStakeRequired * SlashPercentage
-		if err := rc.SlashStake(ctx, rating.RaterID, fmt.Sprintf("%.2f", slashAmount)); err != nil {
-			return err
-		}
-
-		// Revert reputation update
-		if err := rc.revertRating(ctx, &rating); err != nil {
-			return err
-		}
-
-		rc.incrementMetrics(ctx, "overturned")
-	} else {
-		rc.incrementMetrics(ctx, "upheld")
-	}
-
-	return putState(ctx, dKey, &dispute)
-}
-
-func (rc *ReputationContract) revertRating(ctx contractapi.TransactionContextInterface, rating *Rating) error {
-	rep, err := getOrInitReputation(ctx, rating.ActorID, rating.Dimension)
-	if err != nil {
-		return err
-	}
-
-	// Reverse the rating effect
-	if rating.Value >= 0.5 {
-		rep.Alpha -= rating.Weight * rating.Value
-	} else {
-		rep.Beta -= rating.Weight * (1.0 - rating.Value)
-	}
-
-	if rep.Alpha < 1.0 {
-		rep.Alpha = 1.0
-	}
-	if rep.Beta < 1.0 {
-		rep.Beta = 1.0
-	}
-
-	key, _ := reputationKey(ctx, rating.ActorID, rating.Dimension)
-	return putState(ctx, key, rep)
-}
-
-// ============================================================================
-// RATER WEIGHT CALCULATION
-// ============================================================================
-
-func (rc *ReputationContract) calculateRaterWeight(
-	ctx contractapi.TransactionContextInterface,
-	raterID string,
-	dimension string,
-) (float64, error) {
-	// Get rater's own reputation in this dimension
-	rep, err := getOrInitReputation(ctx, raterID, dimension)
-	if err != nil {
-		return MinRaterWeight, nil // Default for new raters
-	}
-
-	// Apply time decay
+// applyDynamicDecay applies variance-based time decay to reputation
+func applyDynamicDecay(rep *Reputation, config *SystemConfig) *Reputation {
 	now := time.Now().Unix()
-	timeSinceLastUpdate := float64(now - rep.LastTs)
-	decayFactor := math.Pow(DecayRate, timeSinceLastUpdate/DecayPeriod)
+	timeDelta := float64(now - rep.LastTs)
 
-	effectiveAlpha := rep.Alpha * decayFactor
-	effectiveBeta := rep.Beta * decayFactor
+	// Calculate Beta distribution variance
+	// Var = αβ / [(α+β)²(α+β+1)]
+	alpha := rep.Alpha
+	beta := rep.Beta
+	sum := alpha + beta
 
-	score := effectiveAlpha / (effectiveAlpha + effectiveBeta)
+	variance := (alpha * beta) / (sum * sum * (sum + 1))
 
-	// Weight = score * sqrt(confidence)
-	// Confidence increases with number of observations
-	confidence := math.Sqrt(float64(rep.TotalEvents) / (float64(rep.TotalEvents) + 10.0))
-	weight := score * (1.0 + confidence)
+	// Normalize variance (max variance ≈ 0.083 at α=β=1)
+	maxVariance := 0.083
+	normalizedVariance := math.Min(variance/maxVariance, 1.0)
 
-	// Clamp to valid range
-	if weight < MinRaterWeight {
-		weight = MinRaterWeight
+	// Adaptive decay: high variance → faster decay
+	adaptiveDecayRate := config.DecayRate + (1.0-config.DecayRate)*normalizedVariance*0.5
+
+	// Apply decay
+	decayFactor := math.Pow(adaptiveDecayRate, timeDelta/config.DecayPeriod)
+
+	effectiveAlpha := alpha * decayFactor
+	effectiveBeta := beta * decayFactor
+
+	// Prevent decay below initial values
+	if effectiveAlpha < config.InitialAlpha {
+		effectiveAlpha = config.InitialAlpha
 	}
-	if weight > MaxRaterWeight {
-		weight = MaxRaterWeight
+	if effectiveBeta < config.InitialBeta {
+		effectiveBeta = config.InitialBeta
 	}
 
-	return weight, nil
-}
-
-// ============================================================================
-// ATTACK DETECTION (for KPI analysis)
-// ============================================================================
-
-func (rc *ReputationContract) detectAnomalies(
-	ctx contractapi.TransactionContextInterface,
-	actorID string,
-	raterID string,
-	dimension string,
-	value float64,
-) {
-	// Simple heuristics for demonstration
-	eventID := fmt.Sprintf("ATK-%d-%s-%s", time.Now().Unix(), actorID, raterID)
-
-	// Example: Detect potential sybil if rater is new but giving extreme ratings
-	raterRep, _ := getOrInitReputation(ctx, raterID, dimension)
-	if raterRep.TotalEvents < 5 && (value < 0.1 || value > 0.9) {
-		event := AttackEvent{
-			EventID:     eventID,
-			EventType:   "potential_sybil",
-			ActorIDs:    []string{raterID, actorID},
-			Confidence:  0.6,
-			Description: "New rater giving extreme rating",
-			Timestamp:   time.Now().Unix(),
-			Detected:    true,
-		}
-
-		key, _ := attackEventKey(ctx, eventID)
-		putState(ctx, key, &event)
+	return &Reputation{
+		ActorID:     rep.ActorID,
+		Dimension:   rep.Dimension,
+		Alpha:       effectiveAlpha,
+		Beta:        effectiveBeta,
+		TotalEvents: rep.TotalEvents,
+		LastTs:      rep.LastTs,
 	}
 }
 
-// ============================================================================
-// METRICS AND ANALYTICS
-// ============================================================================
-
-func (rc *ReputationContract) incrementMetrics(ctx contractapi.TransactionContextInterface, metricType string) error {
-	key, _ := metricsKey(ctx)
-	var metrics SystemMetrics
-
-	err := getState(ctx, key, &metrics)
-	if err != nil {
-		// Initialize if doesn't exist
-		metrics = SystemMetrics{
-			TotalRatings:       0,
-			TotalDisputes:      0,
-			DisputesUpheld:     0,
-			DisputesOverturned: 0,
-			TotalStakeSlashed:  0,
-			TotalActors:        0,
-			LastUpdated:        time.Now().Unix(),
-		}
-	}
-
-	switch metricType {
-	case "rating":
-		metrics.TotalRatings++
-	case "dispute":
-		metrics.TotalDisputes++
-	case "upheld":
-		metrics.DisputesUpheld++
-	case "overturned":
-		metrics.DisputesOverturned++
-	case "slash":
-		metrics.TotalStakeSlashed += MinStakeRequired * SlashPercentage
-	}
-
-	metrics.LastUpdated = time.Now().Unix()
-	return putState(ctx, key, &metrics)
-}
-
-// GetSystemMetrics - Query overall system statistics
-func (rc *ReputationContract) GetSystemMetrics(
-	ctx contractapi.TransactionContextInterface,
-) (*SystemMetrics, error) {
-	key, _ := metricsKey(ctx)
-	var metrics SystemMetrics
-	if err := getState(ctx, key, &metrics); err != nil {
-		return &SystemMetrics{}, nil
-	}
-	return &metrics, nil
-}
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-func generateRatingID(raterID, actorID, dimension string, timestamp int64) string {
-	data := fmt.Sprintf("%s:%s:%s:%d", raterID, actorID, dimension, timestamp)
-	hash := sha256.Sum256([]byte(data))
-	return fmt.Sprintf("RAT-%x", hash[:8])
-}
-
-func generateDisputeID(ratingID, challengerID string) string {
-	data := fmt.Sprintf("%s:%s:%d", ratingID, challengerID, time.Now().Unix())
-	hash := sha256.Sum256([]byte(data))
-	return fmt.Sprintf("DIS-%x", hash[:8])
-}
-
+// calculateWilsonCI computes Wilson score confidence interval
 func calculateWilsonCI(alpha, beta, confidence float64) [2]float64 {
-	// Wilson score interval for Beta distribution
 	n := alpha + beta
-	p := alpha / n
-
-	if n < 2 {
-		return [2]float64{0, 1}
+	if n == 0 {
+		return [2]float64{0, 0}
 	}
 
+	p := alpha / n
 	z := 1.96 // 95% confidence
-	denominator := 1 + z*z/n
-	centre := (p + z*z/(2*n)) / denominator
-	spread := z * math.Sqrt((p*(1-p)/n)+(z*z/(4*n*n))) / denominator
 
-	lower := centre - spread
-	upper := centre + spread
+	if confidence == 0.99 {
+		z = 2.576
+	}
+
+	denominator := 1 + (z * z / n)
+	centre := (p + (z*z)/(2*n)) / denominator
+	margin := (z * math.Sqrt((p*(1-p))/n+(z*z)/(4*n*n))) / denominator
+
+	lower := centre - margin
+	upper := centre + margin
 
 	if lower < 0 {
 		lower = 0
@@ -740,330 +1280,237 @@ func calculateWilsonCI(alpha, beta, confidence float64) [2]float64 {
 	return [2]float64{lower, upper}
 }
 
-// ============================================================================
-// QUERY FUNCTIONS FOR KPI ANALYSIS
-// ============================================================================
-
-// GetRatingHistory - Get all ratings for an actor (for analysis)
-func (rc *ReputationContract) GetRatingHistory(
-	ctx contractapi.TransactionContextInterface,
-	actorID string,
-	dimension string,
-) ([]*Rating, error) {
-	iterator, err := ctx.GetStub().GetStateByPartialCompositeKey(prefixRating, []string{})
-	if err != nil {
-		return nil, err
-	}
-	defer iterator.Close()
-
-	var ratings []*Rating
-	for iterator.HasNext() {
-		queryResponse, err := iterator.Next()
-		if err != nil {
-			return nil, err
-		}
-
-		var rating Rating
-		if err := json.Unmarshal(queryResponse.Value, &rating); err != nil {
-			continue
-		}
-
-		if rating.ActorID == actorID && rating.Dimension == dimension {
-			ratings = append(ratings, &rating)
-		}
-	}
-
-	return ratings, nil
+// generateRatingID creates unique rating identifier
+func generateRatingID(raterID, actorID, dimension string, timestamp int64) string {
+	data := fmt.Sprintf("%s:%s:%s:%d", raterID, actorID, dimension, timestamp)
+	hash := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("RATING:%x", hash[:16])
 }
 
-// GetAttackEvents - Get detected attack events for analysis
-func (rc *ReputationContract) GetAttackEvents(
-	ctx contractapi.TransactionContextInterface,
-) ([]*AttackEvent, error) {
-	iterator, err := ctx.GetStub().GetStateByPartialCompositeKey(prefixAttackEvent, []string{})
-	if err != nil {
-		return nil, err
-	}
-	defer iterator.Close()
-
-	var events []*AttackEvent
-	for iterator.HasNext() {
-		queryResponse, err := iterator.Next()
-		if err != nil {
-			continue
-		}
-
-		var event AttackEvent
-		if err := json.Unmarshal(queryResponse.Value, &event); err != nil {
-			continue
-		}
-
-		events = append(events, &event)
-	}
-
-	return events, nil
+// generateDisputeID creates unique dispute identifier
+func generateDisputeID(ratingID, initiatorID string, timestamp int64) string {
+	data := fmt.Sprintf("%s:%s:%d", ratingID, initiatorID, timestamp)
+	hash := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("DISPUTE:%x", hash[:16])
 }
 
-// GetDisputeStats - Get dispute resolution statistics
-func (rc *ReputationContract) GetDisputeStats(
-	ctx contractapi.TransactionContextInterface,
-) (map[string]interface{}, error) {
-	iterator, err := ctx.GetStub().GetStateByPartialCompositeKey(prefixDispute, []string{})
-	if err != nil {
-		return nil, err
+// isAdmin checks if caller has admin privileges
+func isAdmin(ctx contractapi.TransactionContextInterface) bool {
+	// Option 1: Check MSP attribute
+	val, ok, _ := ctx.GetClientIdentity().GetAttributeValue("admin")
+	if ok && val == "true" {
+		return true
 	}
-	defer iterator.Close()
 
-	var totalDisputes int64
-	var resolved int64
-	var upheld int64
-	var overturned int64
-	var totalResolutionTime int64
-
-	for iterator.HasNext() {
-		queryResponse, err := iterator.Next()
-		if err != nil {
-			continue
-		}
-
-		var dispute Dispute
-		if err := json.Unmarshal(queryResponse.Value, &dispute); err != nil {
-			continue
-		}
-
-		totalDisputes++
-		if dispute.Status == "resolved" {
-			resolved++
-			if dispute.Verdict == "upheld" {
-				upheld++
-			} else if dispute.Verdict == "overturned" {
-				overturned++
-			}
-
-			resolutionTime := dispute.ResolvedTs - dispute.Timestamp
-			totalResolutionTime += resolutionTime
+	// Option 2: Check against admin list
+	adminListJSON, err := ctx.GetStub().GetState("ADMIN_LIST")
+	if err == nil && adminListJSON != nil {
+		var admins map[string]bool
+		if err := json.Unmarshal(adminListJSON, &admins); err == nil {
+			callerID, _ := ctx.GetClientIdentity().GetID()
+			return admins[callerID]
 		}
 	}
 
-	avgResolutionTime := float64(0)
-	if resolved > 0 {
-		avgResolutionTime = float64(totalResolutionTime) / float64(resolved)
+	return false
+}
+
+// isArbitrator checks if caller has arbitrator privileges
+func isArbitrator(ctx contractapi.TransactionContextInterface) bool {
+	// Check MSP attribute
+	val, ok, _ := ctx.GetClientIdentity().GetAttributeValue("arbitrator")
+	if ok && val == "true" {
+		return true
 	}
 
-	return map[string]interface{}{
-		"totalDisputes":        totalDisputes,
-		"resolved":             resolved,
-		"upheld":               upheld,
-		"overturned":           overturned,
-		"avgResolutionTimeSec": avgResolutionTime,
-		"upheldRate":           float64(upheld) / float64(resolved),
-		"overturnedRate":       float64(overturned) / float64(resolved),
-	}, nil
+	// Check against arbitrator list
+	arbitratorListJSON, err := ctx.GetStub().GetState("ARBITRATOR_LIST")
+	if err == nil && arbitratorListJSON != nil {
+		var arbitrators map[string]bool
+		if err := json.Unmarshal(arbitratorListJSON, &arbitrators); err == nil {
+			callerID, _ := ctx.GetClientIdentity().GetID()
+			return arbitrators[callerID]
+		}
+	}
+
+	return false
 }
 
 // ============================================================================
-// ADVANCED QUERIES FOR MARL ANALYSIS
+// ADMIN MANAGEMENT FUNCTIONS
 // ============================================================================
 
-// GetAgentProfile - Get comprehensive profile for MARL agent modeling
-func (rc *ReputationContract) GetAgentProfile(
+// AddAdmin adds a new administrator (must be called by existing admin)
+func (rc *ReputationContract) AddAdmin(
 	ctx contractapi.TransactionContextInterface,
-	actorID string,
-) (map[string]interface{}, error) {
-	dimensions := []string{"quality", "delivery", "compliance", "warranty"}
-
-	profile := make(map[string]interface{})
-	profile["actorId"] = actorID
-
-	reputations := make(map[string]interface{})
-	for _, dim := range dimensions {
-		rep, err := rc.GetReputation(ctx, actorID, dim)
-		if err == nil {
-			reputations[dim] = rep
-		}
-	}
-	profile["reputations"] = reputations
-
-	// Get stake info
-	stake, _ := rc.getOrInitStake(ctx, actorID)
-	profile["stake"] = map[string]interface{}{
-		"total":     stake.Amount,
-		"locked":    stake.LockedAmount,
-		"available": stake.Amount - stake.LockedAmount,
-	}
-
-	// Count ratings given and received
-	ratingsGiven := 0
-	ratingsReceived := 0
-iterator, _ := ctx.GetStub().GetStateByPartialCompositeKey(prefixRating, []string{})
-	defer iterator.Close()
-
-	for iterator.HasNext() {
-		queryResponse, _ := iterator.Next()
-		var rating Rating
-		if json.Unmarshal(queryResponse.Value, &rating) == nil {
-			if rating.RaterID == actorID {
-				ratingsGiven++
-			}
-			if rating.ActorID == actorID {
-				ratingsReceived++
-			}
-		}
-	}
-
-	profile["ratingsGiven"] = ratingsGiven
-	profile["ratingsReceived"] = ratingsReceived
-
-	// Get dispute involvement
-	disputesInitiated := 0
-	disputesAgainst := 0
-
-	dispIterator, _ := ctx.GetStub().GetStateByPartialCompositeKey(prefixDispute, []string{})
-	defer dispIterator.Close()
-
-	for dispIterator.HasNext() {
-		queryResponse, _ := dispIterator.Next()
-		var dispute Dispute
-		if json.Unmarshal(queryResponse.Value, &dispute) == nil {
-			if dispute.Challenger == actorID {
-				disputesInitiated++
-			}
-			// Check if dispute is against this actor's rating
-			rKey, _ := ratingKey(ctx, dispute.RatingID)
-			var rating Rating
-			if getState(ctx, rKey, &rating) == nil {
-				if rating.ActorID == actorID {
-					disputesAgainst++
-				}
-			}
-		}
-	}
-
-	profile["disputesInitiated"] = disputesInitiated
-	profile["disputesAgainst"] = disputesAgainst
-
-	return profile, nil
-}
-
-// BatchGetReputations - Efficient batch query for MARL state
-func (rc *ReputationContract) BatchGetReputations(
-	ctx contractapi.TransactionContextInterface,
-	actorIDs string, // Comma-separated list
-	dimension string,
-) ([]map[string]interface{}, error) {
-	ids := strings.Split(actorIDs, ",")
-	results := make([]map[string]interface{}, 0)
-
-	for _, actorID := range ids {
-		actorID = trim(actorID)
-		if actorID == "" {
-			continue
-		}
-
-		rep, err := rc.GetReputation(ctx, actorID, dimension)
-		if err == nil {
-			results = append(results, rep)
-		}
-	}
-
-	return results, nil
-}
-
-// SimulateRatingImpact - Predict reputation change without committing
-func (rc *ReputationContract) SimulateRatingImpact(
-	ctx contractapi.TransactionContextInterface,
-	actorID string,
-	dimension string,
-	valueStr string,
-) (map[string]interface{}, error) {
-	value, err := strconv.ParseFloat(valueStr, 64)
-	if err != nil {
-		return nil, errors.New("invalid value")
-	}
-
-	// Get current state
-	currentRep, err := rc.GetReputation(ctx, actorID, dimension)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get rater weight
-	raterID, _ := ctx.GetClientIdentity().GetID()
-	weight, _ := rc.calculateRaterWeight(ctx, raterID, dimension)
-
-	// Simulate update
-	alpha := currentRep["alpha"].(float64)
-	beta := currentRep["beta"].(float64)
-
-	if value >= 0.5 {
-		alpha += weight * value
-	} else {
-		beta += weight * (1.0 - value)
-	}
-
-	newScore := alpha / (alpha + beta)
-	oldScore := currentRep["score"].(float64)
-
-	return map[string]interface{}{
-		"currentScore":   oldScore,
-		"predictedScore": newScore,
-		"scoreDelta":     newScore - oldScore,
-		"raterWeight":    weight,
-	}, nil
-}
-
-// ============================================================================
-// TESTING AND DEBUGGING FUNCTIONS
-// ============================================================================
-
-// ResetReputation - FOR TESTING ONLY
-func (rc *ReputationContract) ResetReputation(
-	ctx contractapi.TransactionContextInterface,
-	actorID string,
-	dimension string,
+	newAdminID string,
 ) error {
-	rep := &Reputation{
-		ActorID:     actorID,
-		Dimension:   dimension,
-		Alpha:       1.0,
-		Beta:        1.0,
-		LastTs:      time.Now().Unix(),
-		TotalEvents: 0,
+	if !isAdmin(ctx) {
+		return fmt.Errorf("unauthorized: only admin can add admins")
 	}
 
-	key, _ := reputationKey(ctx, actorID, dimension)
-	return putState(ctx, key, rep)
+	// Load or initialize admin list
+	adminListJSON, err := ctx.GetStub().GetState("ADMIN_LIST")
+	admins := make(map[string]bool)
+
+	if err == nil && adminListJSON != nil {
+		json.Unmarshal(adminListJSON, &admins)
+	}
+
+	// Add new admin
+	admins[newAdminID] = true
+
+	// Store updated list
+	updatedJSON, _ := json.Marshal(admins)
+	err = ctx.GetStub().PutState("ADMIN_LIST", updatedJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update admin list: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"adminId": newAdminID,
+		"action":  "added",
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("AdminUpdated", eventJSON)
+
+	return nil
 }
 
-// GetAllActors - List all actors with reputation records
-func (rc *ReputationContract) GetAllActors(
+// RemoveAdmin removes an administrator
+func (rc *ReputationContract) RemoveAdmin(
 	ctx contractapi.TransactionContextInterface,
-) ([]string, error) {
-	iterator, err := ctx.GetStub().GetStateByPartialCompositeKey(prefixReputation, []string{})
+	adminID string,
+) error {
+	if !isAdmin(ctx) {
+		return fmt.Errorf("unauthorized: only admin can remove admins")
+	}
+
+	// Load admin list
+	adminListJSON, err := ctx.GetStub().GetState("ADMIN_LIST")
+	if err != nil || adminListJSON == nil {
+		return fmt.Errorf("admin list not found")
+	}
+
+	var admins map[string]bool
+	json.Unmarshal(adminListJSON, &admins)
+
+	// Remove admin
+	delete(admins, adminID)
+
+	// Ensure at least one admin remains
+	if len(admins) == 0 {
+		return fmt.Errorf("cannot remove last admin")
+	}
+
+	// Store updated list
+	updatedJSON, _ := json.Marshal(admins)
+	err = ctx.GetStub().PutState("ADMIN_LIST", updatedJSON)
 	if err != nil {
-		return nil, err
-	}
-	defer iterator.Close()
-
-	actorSet := make(map[string]bool)
-	for iterator.HasNext() {
-		queryResponse, err := iterator.Next()
-		if err != nil {
-			continue
-		}
-
-		var rep Reputation
-		if err := json.Unmarshal(queryResponse.Value, &rep); err != nil {
-			continue
-		}
-
-		actorSet[rep.ActorID] = true
+		return fmt.Errorf("failed to update admin list: %v", err)
 	}
 
-	actors := make([]string, 0, len(actorSet))
-	for actor := range actorSet {
-		actors = append(actors, actor)
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"adminId": adminID,
+		"action":  "removed",
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("AdminUpdated", eventJSON)
+
+	return nil
+}
+
+// AddArbitrator adds a new arbitrator
+func (rc *ReputationContract) AddArbitrator(
+	ctx contractapi.TransactionContextInterface,
+	arbitratorID string,
+) error {
+	if !isAdmin(ctx) {
+		return fmt.Errorf("unauthorized: only admin can add arbitrators")
 	}
 
-	return actors, nil
+	// Load or initialize arbitrator list
+	arbitratorListJSON, err := ctx.GetStub().GetState("ARBITRATOR_LIST")
+	arbitrators := make(map[string]bool)
+
+	if err == nil && arbitratorListJSON != nil {
+		json.Unmarshal(arbitratorListJSON, &arbitrators)
+	}
+
+	// Add new arbitrator
+	arbitrators[arbitratorID] = true
+
+	// Store updated list
+	updatedJSON, _ := json.Marshal(arbitrators)
+	err = ctx.GetStub().PutState("ARBITRATOR_LIST", updatedJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update arbitrator list: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"arbitratorId": arbitratorID,
+		"action":       "added",
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("ArbitratorUpdated", eventJSON)
+
+	return nil
+}
+
+// RemoveArbitrator removes an arbitrator
+func (rc *ReputationContract) RemoveArbitrator(
+	ctx contractapi.TransactionContextInterface,
+	arbitratorID string,
+) error {
+	if !isAdmin(ctx) {
+		return fmt.Errorf("unauthorized: only admin can remove arbitrators")
+	}
+
+	// Load arbitrator list
+	arbitratorListJSON, err := ctx.GetStub().GetState("ARBITRATOR_LIST")
+	if err != nil || arbitratorListJSON == nil {
+		return fmt.Errorf("arbitrator list not found")
+	}
+
+	var arbitrators map[string]bool
+	json.Unmarshal(arbitratorListJSON, &arbitrators)
+
+	// Remove arbitrator
+	delete(arbitrators, arbitratorID)
+
+	// Store updated list
+	updatedJSON, _ := json.Marshal(arbitrators)
+	err = ctx.GetStub().PutState("ARBITRATOR_LIST", updatedJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update arbitrator list: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"arbitratorId": arbitratorID,
+		"action":       "removed",
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("ArbitratorUpdated", eventJSON)
+
+	return nil
+}
+
+// ============================================================================
+// MAIN FUNCTION
+// ============================================================================
+
+func main() {
+	chaincode, err := contractapi.NewChaincode(&ReputationContract{})
+	if err != nil {
+		fmt.Printf("Error creating reputation chaincode: %v\n", err)
+		return
+	}
+
+	if err := chaincode.Start(); err != nil {
+		fmt.Printf("Error starting reputation chaincode: %v\n", err)
+	}
 }
