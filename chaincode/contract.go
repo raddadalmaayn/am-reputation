@@ -3,9 +3,11 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
+        "encoding/base64" 
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
@@ -14,7 +16,6 @@ import (
 // ============================================================================
 // SMART CONTRACT DEFINITION
 // ============================================================================
-
 type ReputationContract struct {
 	contractapi.Contract
 }
@@ -110,18 +111,18 @@ func (rc *ReputationContract) InitConfig(ctx contractapi.TransactionContextInter
 	}
 
 	// Allow anyone to initialize if config doesn't exist (bootstrap)
-	// After initialization, only admins can update via UpdateConfig
-
 	config := SystemConfig{
 		MinStakeRequired: 10000.0,
 		DisputeCost:      100.0,
 		SlashPercentage:  0.1,
-		DecayRate:        0.98,
-		DecayPeriod:      86400.0, // 1 day in seconds
-		InitialAlpha:     2.0,
-		InitialBeta:      2.0,
-		MinRaterWeight:   0.1,
-		MaxRaterWeight:   5.0,
+
+		DecayRate:      0.98,
+		DecayPeriod:    86400.0, // 1 day in seconds
+		InitialAlpha:   2.0,
+		InitialBeta:    2.0,
+		MinRaterWeight: 0.1,
+		MaxRaterWeight: 5.0,
+
 		ValidDimensions: map[string]bool{
 			"quality":    true,
 			"delivery":   true,
@@ -134,6 +135,7 @@ func (rc *ReputationContract) InitConfig(ctx contractapi.TransactionContextInter
 			"compliance": "rating_compliance",
 			"warranty":   "rating_warranty",
 		},
+
 		Version:     1,
 		LastUpdated: time.Now().Unix(),
 	}
@@ -188,6 +190,50 @@ func (rc *ReputationContract) UpdateConfig(
 
 	// Emit event
 	ctx.GetStub().SetEvent("ConfigUpdated", updatedJSON)
+
+	return nil
+}
+
+// *** FIX 1: ADD UpdateDecayRate function ***
+func (rc *ReputationContract) UpdateDecayRate(
+	ctx contractapi.TransactionContextInterface,
+	newRateStr string,
+) error {
+	if !isAdmin(ctx) {
+		return fmt.Errorf("unauthorized: admin role required")
+	}
+
+	newRate, err := strconv.ParseFloat(newRateStr, 64)
+	if err != nil || newRate <= 0 || newRate > 1 {
+		return fmt.Errorf("invalid decay rate: must be between 0 and 1")
+	}
+
+	config, err := getConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	config.DecayRate = newRate
+	config.Version++
+	config.LastUpdated = time.Now().Unix()
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %v", err)
+	}
+
+	err = ctx.GetStub().PutState("SYSTEM_CONFIG", configJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update config: %v", err)
+	}
+
+	// Emit event
+	eventPayload := map[string]interface{}{
+		"decayRate": newRate,
+		"version":   config.Version,
+	}
+	eventJSON, _ := json.Marshal(eventPayload)
+	ctx.GetStub().SetEvent("DecayRateUpdated", eventJSON)
 
 	return nil
 }
@@ -253,13 +299,17 @@ func (rc *ReputationContract) AddStake(
 		return fmt.Errorf("invalid amount: must be positive number")
 	}
 
+	// *** FIX 2: Use normalized identity for stake key ***
 	actorID, err := ctx.GetClientIdentity().GetID()
 	if err != nil {
 		return fmt.Errorf("failed to get actor ID: %v", err)
 	}
 
+	// Normalize identity
+	normalizedID := normalizeIdentity(actorID)
+
 	// Load or initialize stake
-	stake, err := getOrInitStake(ctx, actorID)
+	stake, err := getOrInitStake(ctx, normalizedID)
 	if err != nil {
 		return err
 	}
@@ -274,7 +324,7 @@ func (rc *ReputationContract) AddStake(
 		return fmt.Errorf("failed to marshal stake: %v", err)
 	}
 
-	stakeKey := fmt.Sprintf("STAKE:%s", actorID)
+	stakeKey := fmt.Sprintf("STAKE:%s", normalizedID)
 	err = ctx.GetStub().PutState(stakeKey, stakeJSON)
 	if err != nil {
 		return fmt.Errorf("failed to store stake: %v", err)
@@ -282,7 +332,7 @@ func (rc *ReputationContract) AddStake(
 
 	// Emit event
 	eventPayload := map[string]interface{}{
-		"actorId": actorID,
+		"actorId": normalizedID,
 		"amount":  amount,
 		"balance": stake.Balance,
 	}
@@ -297,7 +347,8 @@ func (rc *ReputationContract) GetStake(
 	ctx contractapi.TransactionContextInterface,
 	actorID string,
 ) (*Stake, error) {
-	return getOrInitStake(ctx, actorID)
+	normalizedID := normalizeIdentity(actorID)
+	return getOrInitStake(ctx, normalizedID)
 }
 
 // ============================================================================
@@ -330,11 +381,27 @@ func (rc *ReputationContract) SubmitRating(
 		return "", fmt.Errorf("failed to get rater ID: %v", err)
 	}
 
-	// CRITICAL: Prevent self-rating
-	if raterID == actorID {
-		return "", fmt.Errorf("self-rating is not allowed")
+	// *** ADD DEBUG OUTPUT ***
+	fmt.Printf("=== SELF-RATING DEBUG ===\n")
+	fmt.Printf("Raw raterID from GetID(): %s\n", raterID)
+	fmt.Printf("Input actorID parameter: %s\n", actorID)
+
+	// *** FIX 3: Normalize both IDs for comparison ***
+	normalizedRaterID := normalizeIdentity(raterID)
+	normalizedActorID := normalizeIdentity(actorID)
+
+	// *** ADD DEBUG OUTPUT ***
+	fmt.Printf("Normalized raterID: %s\n", normalizedRaterID)
+	fmt.Printf("Normalized actorID: %s\n", normalizedActorID)
+	fmt.Printf("Are they equal? %v\n", normalizedRaterID == normalizedActorID)
+	fmt.Printf("=========================\n")
+
+	// CRITICAL: Prevent self-rating with normalized IDs
+	if normalizedRaterID == normalizedActorID {
+		return "", fmt.Errorf("self-rating is not allowed: rater %s cannot rate themselves", normalizedRaterID)
 	}
 
+	// ... rest of function continues unchanged
 	// Validate dimension
 	config, err := getConfig(ctx)
 	if err != nil {
@@ -345,31 +412,31 @@ func (rc *ReputationContract) SubmitRating(
 		return "", fmt.Errorf("invalid dimension: %s", dimension)
 	}
 
-	// Check rater has minimum stake
-	raterStake, err := getOrInitStake(ctx, raterID)
+	// *** FIX 4: Check rater has minimum stake using normalized ID ***
+	raterStake, err := getOrInitStake(ctx, normalizedRaterID)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get rater stake: %v", err)
 	}
 
 	if raterStake.Balance < config.MinStakeRequired {
-		return "", fmt.Errorf("insufficient stake: minimum %f required", config.MinStakeRequired)
+		return "", fmt.Errorf("insufficient stake: have %f, require %f", raterStake.Balance, config.MinStakeRequired)
 	}
 
 	// Calculate rater weight based on METAREPUTATION
-	weight, err := rc.calculateRaterWeight(ctx, raterID, dimension)
+	weight, err := rc.calculateRaterWeight(ctx, normalizedRaterID, dimension)
 	if err != nil {
 		return "", fmt.Errorf("failed to calculate rater weight: %v", err)
 	}
 
 	// Generate rating ID
 	txID := ctx.GetStub().GetTxID()
-	ratingID := generateRatingID(raterID, actorID, dimension, timestamp)
+	ratingID := generateRatingID(normalizedRaterID, normalizedActorID, dimension, timestamp)
 
-	// Create rating record
+	// Create rating record (store normalized IDs)
 	rating := Rating{
 		RatingID:  ratingID,
-		RaterID:   raterID,
-		ActorID:   actorID,
+		RaterID:   normalizedRaterID,
+		ActorID:   normalizedActorID,
 		Dimension: dimension,
 		Value:     value,
 		Weight:    weight,
@@ -398,8 +465,8 @@ func (rc *ReputationContract) SubmitRating(
 	// Emit event
 	eventPayload := map[string]interface{}{
 		"ratingId":  ratingID,
-		"raterId":   raterID,
-		"actorId":   actorID,
+		"raterId":   normalizedRaterID,
+		"actorId":   normalizedActorID,
 		"dimension": dimension,
 		"value":     value,
 		"weight":    weight,
@@ -474,13 +541,13 @@ func (rc *ReputationContract) calculateRaterWeight(
 		return config.MinRaterWeight, err
 	}
 
-	// Get the META-dimension (e.g., "quality" -> "rating_quality")
+	// Get the META-dimension
 	metaDimension, exists := config.MetaDimensions[baseDimension]
 	if !exists {
 		return config.MinRaterWeight, fmt.Errorf("no meta-dimension for %s", baseDimension)
 	}
 
-	// Load rater's METAREPUTATION (their ability to rate this dimension)
+	// Load rater's METAREPUTATION
 	rep, err := getOrInitReputation(ctx, raterID, metaDimension, config)
 	if err != nil {
 		return config.MinRaterWeight, err
@@ -525,6 +592,8 @@ func (rc *ReputationContract) InitiateDispute(
 		return "", fmt.Errorf("failed to get initiator ID: %v", err)
 	}
 
+	normalizedInitiatorID := normalizeIdentity(initiatorID)
+
 	// Load rating
 	ratingJSON, err := ctx.GetStub().GetState(ratingID)
 	if err != nil || ratingJSON == nil {
@@ -537,7 +606,7 @@ func (rc *ReputationContract) InitiateDispute(
 	}
 
 	// Check initiator is the rated actor
-	if initiatorID != rating.ActorID {
+	if normalizedInitiatorID != rating.ActorID {
 		return "", fmt.Errorf("only the rated actor can dispute a rating")
 	}
 
@@ -547,7 +616,7 @@ func (rc *ReputationContract) InitiateDispute(
 		return "", err
 	}
 
-	stake, err := getOrInitStake(ctx, initiatorID)
+	stake, err := getOrInitStake(ctx, normalizedInitiatorID)
 	if err != nil {
 		return "", err
 	}
@@ -561,16 +630,16 @@ func (rc *ReputationContract) InitiateDispute(
 	stake.Locked += config.DisputeCost
 	stake.UpdatedAt = time.Now().Unix()
 
-	stakeKey := fmt.Sprintf("STAKE:%s", initiatorID)
+	stakeKey := fmt.Sprintf("STAKE:%s", normalizedInitiatorID)
 	stakeJSON, _ := json.Marshal(stake)
 	ctx.GetStub().PutState(stakeKey, stakeJSON)
 
 	// Create dispute
-	disputeID := generateDisputeID(ratingID, initiatorID, time.Now().Unix())
+	disputeID := generateDisputeID(ratingID, normalizedInitiatorID, time.Now().Unix())
 	dispute := Dispute{
 		DisputeID:   disputeID,
 		RatingID:    ratingID,
-		InitiatorID: initiatorID,
+		InitiatorID: normalizedInitiatorID,
 		RaterID:     rating.RaterID,
 		ActorID:     rating.ActorID,
 		Dimension:   rating.Dimension,
@@ -593,7 +662,7 @@ func (rc *ReputationContract) InitiateDispute(
 	eventPayload := map[string]interface{}{
 		"disputeId":   disputeID,
 		"ratingId":    ratingID,
-		"initiatorId": initiatorID,
+		"initiatorId": normalizedInitiatorID,
 		"reason":      reason,
 	}
 	eventJSON, _ := json.Marshal(eventPayload)
@@ -636,17 +705,18 @@ func (rc *ReputationContract) ResolveDispute(
 
 	// Get arbitrator ID
 	arbitratorID, _ := ctx.GetClientIdentity().GetID()
+	normalizedArbitratorID := normalizeIdentity(arbitratorID)
 
 	// Update dispute record
 	dispute.Status = verdict
-	dispute.ArbitratorID = arbitratorID
+	dispute.ArbitratorID = normalizedArbitratorID
 	dispute.ArbitratorNotes = arbitratorNotes
 	dispute.ResolvedAt = time.Now().Unix()
 
 	// Determine if rater was correct
 	raterWasCorrect := (verdict == "upheld")
 
-	// CRITICAL: UPDATE METAREPUTATION
+	// Update METAREPUTATION
 	err = rc.updateMetaReputation(ctx, dispute.RaterID, dispute.Dimension, raterWasCorrect)
 	if err != nil {
 		return fmt.Errorf("failed to update metareputation: %v", err)
@@ -832,7 +902,7 @@ func (rc *ReputationContract) slashStake(
 }
 
 // ============================================================================
-// QUERY FUNCTIONS (CouchDB Indexed)
+// QUERY FUNCTIONS
 // ============================================================================
 
 // GetReputation retrieves an actor's reputation with dynamic decay applied
@@ -850,8 +920,10 @@ func (rc *ReputationContract) GetReputation(
 		return nil, fmt.Errorf("invalid dimension: %s", dimension)
 	}
 
+	normalizedActorID := normalizeIdentity(actorID)
+
 	// Load reputation
-	rep, err := getOrInitReputation(ctx, actorID, dimension, config)
+	rep, err := getOrInitReputation(ctx, normalizedActorID, dimension, config)
 	if err != nil {
 		return nil, err
 	}
@@ -866,7 +938,7 @@ func (rc *ReputationContract) GetReputation(
 	ci := calculateWilsonCI(effectiveRep.Alpha, effectiveRep.Beta, 0.95)
 
 	result := map[string]interface{}{
-		"actorId":     actorID,
+		"actorId":     normalizedActorID,
 		"dimension":   dimension,
 		"score":       score,
 		"alpha":       effectiveRep.Alpha,
@@ -880,12 +952,14 @@ func (rc *ReputationContract) GetReputation(
 	return result, nil
 }
 
-// GetRatingHistory retrieves all ratings for an actor (indexed query)
+// GetRatingHistory retrieves all ratings for an actor
 func (rc *ReputationContract) GetRatingHistory(
 	ctx contractapi.TransactionContextInterface,
 	actorID string,
 	dimension string,
 ) ([]Rating, error) {
+	normalizedActorID := normalizeIdentity(actorID)
+
 	// Construct CouchDB query
 	query := fmt.Sprintf(`{
 		"selector": {
@@ -894,7 +968,7 @@ func (rc *ReputationContract) GetRatingHistory(
 		},
 		"sort": [{"timestamp": "desc"}],
 		"limit": 100
-	}`, actorID, dimension)
+	}`, normalizedActorID, dimension)
 
 	resultsIterator, err := ctx.GetStub().GetQueryResult(query)
 	if err != nil {
@@ -919,13 +993,11 @@ func (rc *ReputationContract) GetRatingHistory(
 	return ratings, nil
 }
 
-//
-// GetDisputesByStatus retrieves disputes by status (indexed query)
+// GetDisputesByStatus retrieves disputes by status
 func (rc *ReputationContract) GetDisputesByStatus(
 	ctx contractapi.TransactionContextInterface,
 	status string,
 ) ([]Dispute, error) {
-	// Construct CouchDB query
 	query := fmt.Sprintf(`{
 		"selector": {
 			"status": "%s"
@@ -957,7 +1029,7 @@ func (rc *ReputationContract) GetDisputesByStatus(
 	return disputes, nil
 }
 
-// GetActorsByDimension retrieves actors with reputation above threshold (indexed query)
+// GetActorsByDimension retrieves actors with reputation above threshold
 func (rc *ReputationContract) GetActorsByDimension(
 	ctx contractapi.TransactionContextInterface,
 	dimension string,
@@ -968,7 +1040,6 @@ func (rc *ReputationContract) GetActorsByDimension(
 		return nil, fmt.Errorf("invalid minScore: %v", err)
 	}
 
-	// Construct CouchDB query
 	query := fmt.Sprintf(`{
 		"selector": {
 			"dimension": "%s"
@@ -983,8 +1054,8 @@ func (rc *ReputationContract) GetActorsByDimension(
 	defer resultsIterator.Close()
 
 	config, _ := getConfig(ctx)
-	var results []map[string]interface{}
 
+	var results []map[string]interface{}
 	for resultsIterator.HasNext() {
 		queryResponse, err := resultsIterator.Next()
 		if err != nil {
@@ -1013,18 +1084,20 @@ func (rc *ReputationContract) GetActorsByDimension(
 	return results, nil
 }
 
-// GetRatingsByRater retrieves all ratings submitted by a rater (indexed query)
+// GetRatingsByRater retrieves all ratings submitted by a rater
 func (rc *ReputationContract) GetRatingsByRater(
 	ctx contractapi.TransactionContextInterface,
 	raterID string,
 ) ([]Rating, error) {
+	normalizedRaterID := normalizeIdentity(raterID)
+
 	query := fmt.Sprintf(`{
 		"selector": {
 			"raterId": "%s"
 		},
 		"sort": [{"timestamp": "desc"}],
 		"limit": 100
-	}`, raterID)
+	}`, normalizedRaterID)
 
 	resultsIterator, err := ctx.GetStub().GetQueryResult(query)
 	if err != nil {
@@ -1095,14 +1168,85 @@ func (rc *ReputationContract) GetRating(
 // HELPER FUNCTIONS
 // ============================================================================
 
+// *** FIX 5: ADD normalizeIdentity helper function ***
+// normalizeIdentity extracts CN from X.509 DN or returns simplified ID
+// normalizeIdentity extracts CN from identity string and makes it case-insensitive
+func normalizeIdentity(identity string) string {
+	// First, try to decode if it's base64
+	decoded, err := base64.StdEncoding.DecodeString(identity)
+	if err == nil {
+		// Successfully decoded, use the decoded string
+		identity = string(decoded)
+	}
+	
+	// Handle X.509 DN format: "x509::CN=user1,OU=client::CN=ca.org1.example.com"
+	if strings.Contains(identity, "x509::") {
+		parts := strings.Split(identity, "::")
+		if len(parts) >= 2 {
+			cnPart := parts[1]
+			cnFields := strings.Split(cnPart, ",")
+			for _, field := range cnFields {
+				trimmed := strings.TrimSpace(field)
+				if strings.HasPrefix(strings.ToUpper(trimmed), "CN=") {
+					cn := strings.TrimPrefix(trimmed, "CN=")
+					cn = strings.TrimPrefix(cn, "cn=")
+					// Return lowercase for case-insensitive comparison
+					return strings.ToLower(cn)
+				}
+			}
+		}
+	}
+	
+	// If no x509 format, just return lowercase
+	return strings.ToLower(identity)
+}
 // getConfig retrieves system configuration
+// getConfig retrieves system configuration, initializing if needed
 func getConfig(ctx contractapi.TransactionContextInterface) (*SystemConfig, error) {
 	configJSON, err := ctx.GetStub().GetState("SYSTEM_CONFIG")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config: %v", err)
 	}
+
+	// AUTO-INITIALIZE if config doesn't exist
 	if configJSON == nil {
-		return nil, fmt.Errorf("system config not initialized")
+		config := SystemConfig{
+			MinStakeRequired: 10000.0,
+			DisputeCost:      100.0,
+			SlashPercentage:  0.1,
+			DecayRate:        0.98,
+			DecayPeriod:      86400.0,
+			InitialAlpha:     2.0,
+			InitialBeta:      2.0,
+			MinRaterWeight:   0.1,
+			MaxRaterWeight:   5.0,
+			ValidDimensions: map[string]bool{
+				"quality":    true,
+				"delivery":   true,
+				"compliance": true,
+				"warranty":   true,
+			},
+			MetaDimensions: map[string]string{
+				"quality":    "rating_quality",
+				"delivery":   "rating_delivery",
+				"compliance": "rating_compliance",
+				"warranty":   "rating_warranty",
+			},
+			Version:     1,
+			LastUpdated: time.Now().Unix(),
+		}
+
+		configJSON, err = json.Marshal(config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal config: %v", err)
+		}
+
+		err = ctx.GetStub().PutState("SYSTEM_CONFIG", configJSON)
+		if err != nil {
+			return nil, fmt.Errorf("failed to auto-initialize config: %v", err)
+		}
+
+		return &config, nil
 	}
 
 	var config SystemConfig
@@ -1112,7 +1256,6 @@ func getConfig(ctx contractapi.TransactionContextInterface) (*SystemConfig, erro
 
 	return &config, nil
 }
-
 // validateConfig validates system configuration
 func validateConfig(config *SystemConfig) error {
 	if config.MinStakeRequired < 0 {
@@ -1211,11 +1354,9 @@ func applyDynamicDecay(rep *Reputation, config *SystemConfig) *Reputation {
 	timeDelta := float64(now - rep.LastTs)
 
 	// Calculate Beta distribution variance
-	// Var = αβ / [(α+β)²(α+β+1)]
 	alpha := rep.Alpha
 	beta := rep.Beta
 	sum := alpha + beta
-
 	variance := (alpha * beta) / (sum * sum * (sum + 1))
 
 	// Normalize variance (max variance ≈ 0.083 at α=β=1)
@@ -1258,7 +1399,6 @@ func calculateWilsonCI(alpha, beta, confidence float64) [2]float64 {
 
 	p := alpha / n
 	z := 1.96 // 95% confidence
-
 	if confidence == 0.99 {
 		z = 2.576
 	}
@@ -1308,7 +1448,8 @@ func isAdmin(ctx contractapi.TransactionContextInterface) bool {
 		var admins map[string]bool
 		if err := json.Unmarshal(adminListJSON, &admins); err == nil {
 			callerID, _ := ctx.GetClientIdentity().GetID()
-			return admins[callerID]
+			normalizedCallerID := normalizeIdentity(callerID)
+			return admins[normalizedCallerID]
 		}
 	}
 
@@ -1329,7 +1470,8 @@ func isArbitrator(ctx contractapi.TransactionContextInterface) bool {
 		var arbitrators map[string]bool
 		if err := json.Unmarshal(arbitratorListJSON, &arbitrators); err == nil {
 			callerID, _ := ctx.GetClientIdentity().GetID()
-			return arbitrators[callerID]
+			normalizedCallerID := normalizeIdentity(callerID)
+			return arbitrators[normalizedCallerID]
 		}
 	}
 
@@ -1340,7 +1482,7 @@ func isArbitrator(ctx contractapi.TransactionContextInterface) bool {
 // ADMIN MANAGEMENT FUNCTIONS
 // ============================================================================
 
-// AddAdmin adds a new administrator (must be called by existing admin)
+// AddAdmin adds a new administrator
 func (rc *ReputationContract) AddAdmin(
 	ctx contractapi.TransactionContextInterface,
 	newAdminID string,
@@ -1349,16 +1491,17 @@ func (rc *ReputationContract) AddAdmin(
 		return fmt.Errorf("unauthorized: only admin can add admins")
 	}
 
+	normalizedAdminID := normalizeIdentity(newAdminID)
+
 	// Load or initialize admin list
 	adminListJSON, err := ctx.GetStub().GetState("ADMIN_LIST")
 	admins := make(map[string]bool)
-
 	if err == nil && adminListJSON != nil {
 		json.Unmarshal(adminListJSON, &admins)
 	}
 
 	// Add new admin
-	admins[newAdminID] = true
+	admins[normalizedAdminID] = true
 
 	// Store updated list
 	updatedJSON, _ := json.Marshal(admins)
@@ -1369,7 +1512,7 @@ func (rc *ReputationContract) AddAdmin(
 
 	// Emit event
 	eventPayload := map[string]interface{}{
-		"adminId": newAdminID,
+		"adminId": normalizedAdminID,
 		"action":  "added",
 	}
 	eventJSON, _ := json.Marshal(eventPayload)
@@ -1387,6 +1530,8 @@ func (rc *ReputationContract) RemoveAdmin(
 		return fmt.Errorf("unauthorized: only admin can remove admins")
 	}
 
+	normalizedAdminID := normalizeIdentity(adminID)
+
 	// Load admin list
 	adminListJSON, err := ctx.GetStub().GetState("ADMIN_LIST")
 	if err != nil || adminListJSON == nil {
@@ -1397,7 +1542,7 @@ func (rc *ReputationContract) RemoveAdmin(
 	json.Unmarshal(adminListJSON, &admins)
 
 	// Remove admin
-	delete(admins, adminID)
+	delete(admins, normalizedAdminID)
 
 	// Ensure at least one admin remains
 	if len(admins) == 0 {
@@ -1413,7 +1558,7 @@ func (rc *ReputationContract) RemoveAdmin(
 
 	// Emit event
 	eventPayload := map[string]interface{}{
-		"adminId": adminID,
+		"adminId": normalizedAdminID,
 		"action":  "removed",
 	}
 	eventJSON, _ := json.Marshal(eventPayload)
@@ -1431,16 +1576,17 @@ func (rc *ReputationContract) AddArbitrator(
 		return fmt.Errorf("unauthorized: only admin can add arbitrators")
 	}
 
+	normalizedArbitratorID := normalizeIdentity(arbitratorID)
+
 	// Load or initialize arbitrator list
 	arbitratorListJSON, err := ctx.GetStub().GetState("ARBITRATOR_LIST")
 	arbitrators := make(map[string]bool)
-
 	if err == nil && arbitratorListJSON != nil {
 		json.Unmarshal(arbitratorListJSON, &arbitrators)
 	}
 
 	// Add new arbitrator
-	arbitrators[arbitratorID] = true
+	arbitrators[normalizedArbitratorID] = true
 
 	// Store updated list
 	updatedJSON, _ := json.Marshal(arbitrators)
@@ -1451,7 +1597,7 @@ func (rc *ReputationContract) AddArbitrator(
 
 	// Emit event
 	eventPayload := map[string]interface{}{
-		"arbitratorId": arbitratorID,
+		"arbitratorId": normalizedArbitratorID,
 		"action":       "added",
 	}
 	eventJSON, _ := json.Marshal(eventPayload)
@@ -1469,6 +1615,8 @@ func (rc *ReputationContract) RemoveArbitrator(
 		return fmt.Errorf("unauthorized: only admin can remove arbitrators")
 	}
 
+	normalizedArbitratorID := normalizeIdentity(arbitratorID)
+
 	// Load arbitrator list
 	arbitratorListJSON, err := ctx.GetStub().GetState("ARBITRATOR_LIST")
 	if err != nil || arbitratorListJSON == nil {
@@ -1479,7 +1627,7 @@ func (rc *ReputationContract) RemoveArbitrator(
 	json.Unmarshal(arbitratorListJSON, &arbitrators)
 
 	// Remove arbitrator
-	delete(arbitrators, arbitratorID)
+	delete(arbitrators, normalizedArbitratorID)
 
 	// Store updated list
 	updatedJSON, _ := json.Marshal(arbitrators)
@@ -1490,7 +1638,7 @@ func (rc *ReputationContract) RemoveArbitrator(
 
 	// Emit event
 	eventPayload := map[string]interface{}{
-		"arbitratorId": arbitratorID,
+		"arbitratorId": normalizedArbitratorID,
 		"action":       "removed",
 	}
 	eventJSON, _ := json.Marshal(eventPayload)
@@ -1511,6 +1659,6 @@ func main() {
 	}
 
 	if err := chaincode.Start(); err != nil {
-		fmt.Printf("Error starting reputation chaincode: %v\n", err)
+		fmt.Printf("Error starting reputation chaincode: %v", err)
 	}
 }
