@@ -383,21 +383,6 @@ We welcome contributions. Please:
 4. Push to the branch (`git push origin feature/your-feature`)
 5. Open a Pull Request
 
-## License
-
-[Specify your license here - MIT, Apache 2.0, etc.]
-
-## Citation
-
-If you use this system in your research, please cite:
-```bibtex
-@article{yourname2025reputation,
-  title={Blockchain Reputation System for Additive Manufacturing Supply Chains: Design and Adversarial Validation of a Stake-Based Bayesian Approach},
-  author={Your Name},
-  journal={Conference/Journal Name},
-  year={2025}
-}
-```
 
 ## Acknowledgments
 
@@ -407,7 +392,7 @@ If you use this system in your research, please cite:
 
 ## Contact
 
-For questions or collaboration inquiries, contact [your email] or open an issue on GitHub.
+For questions or collaboration inquiries, contact [raddadalmaayn@unm.edu] or open an issue on GitHub.
 
 ---
 
