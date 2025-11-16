@@ -455,7 +455,31 @@ func (rc *ReputationContract) SubmitRating(
 	if err != nil {
 		return "", fmt.Errorf("failed to store rating: %v", err)
 	}
+// Store rating
+ratingJSON, err = json.Marshal(rating)
+if err != nil {
+    return "", fmt.Errorf("failed to marshal rating: %v", err)
+}
 
+err = ctx.GetStub().PutState(ratingID, ratingJSON)
+if err != nil {
+    return "", fmt.Errorf("failed to store rating: %v", err)
+}
+
+// *** STORE THE RATER-ACTOR PAIR RECORD ***
+raterActorKey := fmt.Sprintf("RATER_ACTOR:%s:%s:%s", normalizedRaterID, normalizedActorID, dimension)
+raterActorRecord := map[string]interface{}{
+    "raterId":   normalizedRaterID,
+    "actorId":   normalizedActorID,
+    "dimension": dimension,
+    "ratingId":  ratingID,
+    "timestamp": timestamp,
+}
+raterActorJSON, _ := json.Marshal(raterActorRecord)
+ctx.GetStub().PutState(raterActorKey, raterActorJSON)
+
+// Update actor's reputation
+err = rc.updateReputation(ctx, &rating)
 	// Update actor's reputation
 	err = rc.updateReputation(ctx, &rating)
 	if err != nil {
@@ -1646,7 +1670,29 @@ func (rc *ReputationContract) RemoveArbitrator(
 
 	return nil
 }
+// ResetStake - TEST ONLY: Reset an actor's stake to zero
+// In production, remove this function or add proper access controls
+func (rc *ReputationContract) ResetStake(
+	ctx contractapi.TransactionContextInterface,
+	actorID string,
+) error {
+	normalizedID := normalizeIdentity(actorID)
+	
+	stake := &Stake{
+		ActorID:   normalizedID,
+		Balance:   0,
+		Locked:    0,
+		UpdatedAt: time.Now().Unix(),
+	}
 
+	stakeKey := fmt.Sprintf("STAKE:%s", normalizedID)
+	stakeJSON, err := json.Marshal(stake)
+	if err != nil {
+		return fmt.Errorf("failed to marshal stake: %v", err)
+	}
+
+	return ctx.GetStub().PutState(stakeKey, stakeJSON)
+}
 // ============================================================================
 // MAIN FUNCTION
 // ============================================================================

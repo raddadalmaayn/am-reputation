@@ -6,3 +6,32 @@ node_modules/
 bin/
 build/
 .DS_Store
+# Backup files
+*.backup
+*~
+*~#
+
+# Vendor dependencies (managed by go.mod)
+chaincode/vendor/
+
+# Build artifacts
+chaincode/repcc
+client-tests/client
+client-tests/Go
+client-tests/directory
+client-tests/test
+client-tests/to
+client-tests/your
+
+# Wallet files (contain private keys)
+client-tests/wallet/
+
+# Node modules
+node_modules/
+
+# Test results
+*.csv
+*.json
+
+# OS files
+.DS_Store
